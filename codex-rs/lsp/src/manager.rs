@@ -52,6 +52,7 @@ pub struct SessionManager {
     pub(crate) clients: Arc<RwLock<HashMap<ClientKey, Arc<ClientHandle>>>>,
     pub(crate) client_health: Arc<RwLock<HashMap<ClientKey, ClientHealth>>>,
     client_locks: Arc<Mutex<HashMap<ClientKey, Arc<Mutex<()>>>>>,
+    workspace_root_cache: Arc<RwLock<HashMap<WorkspaceRootCacheKey, PathBuf>>>,
     drop_guard: Arc<()>,
     spawn_client: Arc<SpawnClientFn>,
     restart_backoff: [Duration; 3],
@@ -64,6 +65,7 @@ impl SessionManager {
             clients: Arc::new(RwLock::new(HashMap::new())),
             client_health: Arc::new(RwLock::new(HashMap::new())),
             client_locks: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root_cache: Arc::new(RwLock::new(HashMap::new())),
             drop_guard: Arc::new(()),
             spawn_client: Arc::new(|server, workspace_root| {
                 Box::pin(ClientHandle::spawn(server, workspace_root))
@@ -86,6 +88,7 @@ impl SessionManager {
             clients: Arc::new(RwLock::new(HashMap::new())),
             client_health: Arc::new(RwLock::new(HashMap::new())),
             client_locks: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root_cache: Arc::new(RwLock::new(HashMap::new())),
             drop_guard: Arc::new(()),
             spawn_client: Arc::new(spawn_client),
             restart_backoff,
@@ -1132,7 +1135,9 @@ impl SessionManager {
 
             matches.push(ServerMatch {
                 file_path: file_path.clone(),
-                workspace_root: resolve_workspace_root(&file_path, &server.root_markers, base_dir),
+                workspace_root: self
+                    .workspace_root_for_file(&file_path, &server.root_markers, base_dir)
+                    .await,
                 server: server.clone(),
             });
         }
@@ -1176,6 +1181,34 @@ impl SessionManager {
 
         matches.sort_by(|a, b| a.server.id.cmp(&b.server.id));
         matches
+    }
+
+    async fn workspace_root_for_file(
+        &self,
+        file_path: &Path,
+        root_markers: &[String],
+        base_dir: &Path,
+    ) -> PathBuf {
+        let directory = if file_path.is_dir() {
+            file_path.to_path_buf()
+        } else {
+            file_path.parent().unwrap_or(file_path).to_path_buf()
+        };
+        let key = WorkspaceRootCacheKey {
+            directory,
+            workspace_boundary: base_dir.to_path_buf(),
+            root_markers: root_markers.to_vec(),
+        };
+        if let Some(workspace_root) = self.workspace_root_cache.read().await.get(&key).cloned() {
+            return workspace_root;
+        }
+
+        let workspace_root = resolve_workspace_root(file_path, root_markers, base_dir);
+        self.workspace_root_cache
+            .write()
+            .await
+            .insert(key, workspace_root.clone());
+        workspace_root
     }
 }
 
@@ -1258,6 +1291,13 @@ pub(crate) struct ClientHealth {
     pub(crate) tracked_documents: Vec<PathBuf>,
     pub(crate) restart_in_progress: bool,
     pub(crate) permanent_broken: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkspaceRootCacheKey {
+    directory: PathBuf,
+    workspace_boundary: PathBuf,
+    root_markers: Vec<String>,
 }
 
 impl Default for ClientHealth {

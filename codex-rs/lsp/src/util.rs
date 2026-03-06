@@ -30,28 +30,37 @@ pub(crate) fn resolve_absolute_path(base_dir: &Path, file_path: &Path) -> PathBu
 pub(crate) fn resolve_workspace_root(
     file_path: &Path,
     root_markers: &[String],
-    base_dir: &Path,
+    workspace_boundary: &Path,
 ) -> PathBuf {
     let start_dir = if file_path.is_dir() {
         file_path
     } else {
         file_path.parent().unwrap_or(file_path)
     };
+    let stop_at_boundary = start_dir.starts_with(workspace_boundary);
+    let mut fallback = start_dir;
 
     for ancestor in start_dir.ancestors() {
-        if root_markers
-            .iter()
-            .any(|marker| ancestor.join(marker).exists())
-        {
+        fallback = ancestor;
+        if directory_matches_root_markers(ancestor, root_markers) {
             return ancestor.to_path_buf();
+        }
+        if stop_at_boundary && ancestor == workspace_boundary {
+            return workspace_boundary.to_path_buf();
         }
     }
 
-    base_dir.to_path_buf()
+    fallback.to_path_buf()
 }
 
 pub(crate) fn workspace_roots_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn directory_matches_root_markers(directory: &Path, root_markers: &[String]) -> bool {
+    root_markers
+        .iter()
+        .any(|marker| directory.join(marker).exists())
 }
 
 #[cfg(test)]
@@ -163,5 +172,45 @@ pub(crate) fn language_id_for_path(path: &Path) -> &'static str {
         Some("m") => "objective-c",
         Some("mm") => "objective-cpp",
         _ => "plaintext",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_workspace_root_prefers_nearest_marker() {
+        let tmp = tempdir().expect("tmp");
+        let workspace = tmp.path().join("workspace");
+        let project = workspace.join("project");
+        let nested = project.join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("marker");
+
+        let file_path = nested.join("main.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("file");
+
+        let root = resolve_workspace_root(&file_path, &["Cargo.toml".to_string()], &workspace);
+        assert_eq!(root, project);
+    }
+
+    #[test]
+    fn resolve_workspace_root_stops_at_workspace_boundary() {
+        let tmp = tempdir().expect("tmp");
+        let outer = tmp.path().join("outer");
+        let workspace = outer.join("workspace");
+        let nested = workspace.join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(outer.join("Cargo.toml"), "[package]\nname = \"outer\"\n")
+            .expect("outer marker");
+
+        let file_path = nested.join("main.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("file");
+
+        let root = resolve_workspace_root(&file_path, &["Cargo.toml".to_string()], &workspace);
+        assert_eq!(root, workspace);
     }
 }
