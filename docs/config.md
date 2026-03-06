@@ -26,7 +26,7 @@ lsp = true
 enabled = true
 ```
 
-Codex ships a small built-in server catalog for `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`, `sourcekit-lsp`, and `intelephense`. A server is only activated when its command is available locally.
+Codex ships a small built-in server catalog for `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`, `sourcekit-lsp`, and `intelephense`. A server is only activated when its command is available locally; v1 does not auto-install or auto-download LSP servers.
 
 You can override a built-in server or add a custom one:
 
@@ -51,7 +51,13 @@ Each server entry supports:
 - `initialization`
 - `root_markers`
 
-When enabled, Codex exposes a built-in `lsp` tool and appends LSP `ERROR` diagnostics for touched files after successful `apply_patch` runs when a matching server is available.
+When enabled, Codex exposes a built-in `lsp` tool with `go_to_definition`, `find_references`, `hover`, `document_symbol`, `workspace_symbol`, `status`, `go_to_implementation`, `prepare_call_hierarchy`, `incoming_calls`, and `outgoing_calls`.
+
+For `workspace_symbol`, you can optionally pass `file_path` to scope the query to the servers that match a specific file type. Without `file_path`, Codex only queries already-active LSP clients for the current workspace.
+
+Codex also appends LSP `ERROR` diagnostics for touched files after successful `apply_patch` runs when a matching server is available.
+
+For PHP projects, the built-in `intelephense` server expects the `intelephense` command to be installed locally. If you use an Intelephense license key, place the file at `$HOME/intelephense/license.txt` on macOS/Linux or `%USERPROFILE%/intelephense/license.txt` on Windows.
 
 ## Apps (Connectors)
 

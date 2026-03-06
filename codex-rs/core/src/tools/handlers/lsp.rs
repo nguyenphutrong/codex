@@ -34,6 +34,7 @@ enum LspOperation {
     Hover,
     DocumentSymbol,
     WorkspaceSymbol,
+    Status,
     GoToImplementation,
     PrepareCallHierarchy,
     IncomingCalls,
@@ -76,25 +77,25 @@ impl ToolHandler for LspHandler {
             .clone();
         let base_dir = turn.cwd.clone();
 
-        let results = match args.operation {
-            LspOperation::GoToDefinition => {
+        let body = match args.operation {
+            LspOperation::GoToDefinition => serialize_lsp_results(
                 manager
                     .definition(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
-            LspOperation::FindReferences => {
+                    .await,
+            ),
+            LspOperation::FindReferences => serialize_lsp_results(
                 manager
                     .references(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
-            LspOperation::Hover => {
+                    .await,
+            ),
+            LspOperation::Hover => serialize_lsp_results(
                 manager
                     .hover(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
+                    .await,
+            ),
             LspOperation::DocumentSymbol => {
                 let file_path = file_path(&args, &base_dir)?;
-                manager.document_symbol(&file_path, &base_dir).await
+                serialize_lsp_results(manager.document_symbol(&file_path, &base_dir).await)
             }
             LspOperation::WorkspaceSymbol => {
                 let query = args
@@ -106,44 +107,72 @@ impl ToolHandler for LspHandler {
                             "query is required for workspace_symbol".to_string(),
                         )
                     })?;
-                manager.workspace_symbol(query, &base_dir).await
+                if args.file_path.is_some() {
+                    let file_path = file_path(&args, &base_dir)?;
+                    serialize_lsp_results(
+                        manager
+                            .workspace_symbol_for_file(query, &file_path, &base_dir)
+                            .await,
+                    )
+                } else {
+                    serialize_lsp_results(manager.workspace_symbol(query, &base_dir).await)
+                }
             }
-            LspOperation::GoToImplementation => {
+            LspOperation::Status => {
+                let file_path = file_path(&args, &base_dir)?;
+                serialize_json_value(manager.status_for_file(&file_path, &base_dir).await)
+            }
+            LspOperation::GoToImplementation => serialize_lsp_results(
                 manager
                     .implementation(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
-            LspOperation::PrepareCallHierarchy => {
+                    .await,
+            ),
+            LspOperation::PrepareCallHierarchy => serialize_lsp_results(
                 manager
                     .prepare_call_hierarchy(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
-            LspOperation::IncomingCalls => {
+                    .await,
+            ),
+            LspOperation::IncomingCalls => serialize_lsp_results(
                 manager
                     .incoming_calls(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
-            LspOperation::OutgoingCalls => {
+                    .await,
+            ),
+            LspOperation::OutgoingCalls => serialize_lsp_results(
                 manager
                     .outgoing_calls(position_request(&args, &base_dir)?, &base_dir)
-                    .await
-            }
-        }
-        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-
-        let body = match results.as_slice() {
-            [single] => serde_json::to_string_pretty(single),
-            _ => serde_json::to_string_pretty(&results),
-        }
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to serialize lsp result: {err}"))
-        })?;
+                    .await,
+            ),
+        }?;
 
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(body),
             success: Some(true),
         })
     }
+}
+
+fn serialize_lsp_results<T>(results: anyhow::Result<Vec<T>>) -> Result<String, FunctionCallError>
+where
+    T: serde::Serialize,
+{
+    let results = results.map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    let value = match results.as_slice() {
+        [single] => serde_json::to_value(single),
+        _ => serde_json::to_value(&results),
+    }
+    .map_err(|err| {
+        FunctionCallError::RespondToModel(format!("failed to serialize lsp result: {err}"))
+    })?;
+    serialize_json_value(value)
+}
+
+fn serialize_json_value<T>(value: T) -> Result<String, FunctionCallError>
+where
+    T: serde::Serialize,
+{
+    serde_json::to_string_pretty(&value).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("failed to serialize lsp result: {err}"))
+    })
 }
 
 fn position_request(

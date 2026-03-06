@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -34,6 +35,7 @@ use tracing::warn;
 use url::Url;
 
 const DIAGNOSTICS_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const DIAGNOSTICS_SETTLE_DELAY: Duration = Duration::from_millis(150);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
 const BROKEN_CLIENT_TTL: Duration = Duration::from_secs(30);
@@ -59,6 +61,7 @@ pub struct LspStatus {
     pub server: String,
     pub workspace_root: PathBuf,
     pub connected: bool,
+    pub broken: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -187,15 +190,28 @@ impl SessionManager {
     }
 
     pub async fn status_for_file(&self, file_path: &Path, base_dir: &Path) -> Vec<LspStatus> {
-        self.matching_server_matches(file_path, base_dir)
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        let connected_clients = self
+            .clients
+            .read()
             .await
-            .into_iter()
-            .map(|server_match| LspStatus {
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut statuses = Vec::new();
+
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let broken = self.is_broken_client(&key).await;
+            statuses.push(LspStatus {
                 server: server_match.server.id.clone(),
                 workspace_root: server_match.workspace_root,
-                connected: true,
-            })
-            .collect()
+                connected: !broken && connected_clients.contains(&key),
+                broken,
+            });
+        }
+
+        statuses
     }
 
     pub async fn definition(
@@ -425,11 +441,35 @@ impl SessionManager {
         query: &str,
         base_dir: &Path,
     ) -> Result<Vec<LspOperationResult>> {
-        let matches = self.workspace_server_matches(base_dir).await;
+        let matches = self.active_workspace_matches(base_dir).await;
         if matches.is_empty() {
-            return Err(anyhow!("No LSP server available for this workspace."));
+            return Err(anyhow!(
+                "No active LSP client available for this workspace. Read or query a file first, or provide file_path to scope workspace_symbol."
+            ));
         }
 
+        self.workspace_symbol_for_matches(query, matches).await
+    }
+
+    pub async fn workspace_symbol_for_file(
+        &self,
+        query: &str,
+        file_path: &Path,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        if matches.is_empty() {
+            return Err(anyhow!("No LSP server available for this file type."));
+        }
+
+        self.workspace_symbol_for_matches(query, matches).await
+    }
+
+    async fn workspace_symbol_for_matches(
+        &self,
+        query: &str,
+        matches: Vec<ServerMatch>,
+    ) -> Result<Vec<LspOperationResult>> {
         let mut results = Vec::new();
         for server_match in matches {
             let key = self.client_key(&server_match);
@@ -842,20 +882,37 @@ impl SessionManager {
         matches
     }
 
-    async fn workspace_server_matches(&self, base_dir: &Path) -> Vec<ServerMatch> {
+    async fn active_workspace_matches(&self, base_dir: &Path) -> Vec<ServerMatch> {
         let Some(config) = self.config.as_ref() else {
             return Vec::new();
         };
 
+        let active_keys = self
+            .clients
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut matches = Vec::new();
-        for server in &config.servers {
-            if resolve_command(&server.command).is_err() {
+        for key in active_keys {
+            if !workspace_roots_overlap(&key.workspace_root, base_dir) {
                 continue;
             }
+            if self.is_broken_client(&key).await {
+                continue;
+            }
+            let Some(server) = config
+                .servers
+                .iter()
+                .find(|server| server.id == key.server_id)
+            else {
+                continue;
+            };
 
             matches.push(ServerMatch {
                 file_path: base_dir.to_path_buf(),
-                workspace_root: resolve_workspace_root(base_dir, &server.root_markers, base_dir),
+                workspace_root: key.workspace_root,
                 server: server.clone(),
             });
         }
@@ -1145,12 +1202,19 @@ impl ClientHandle {
     async fn wait_for_diagnostics(&self, file_path: &Path, previous_revision: u64) -> Result<()> {
         let file_path = file_path.to_path_buf();
         timeout(DIAGNOSTICS_WAIT_TIMEOUT, async {
+            let mut observed_revision = previous_revision;
             loop {
                 let current_revision = self.diagnostic_revision(&file_path).await;
-                if current_revision > previous_revision {
+                if current_revision <= observed_revision {
+                    self.state.diagnostics_notify.notified().await;
+                    continue;
+                }
+
+                observed_revision = current_revision;
+                tokio::time::sleep(DIAGNOSTICS_SETTLE_DELAY).await;
+                if self.diagnostic_revision(&file_path).await == observed_revision {
                     break;
                 }
-                self.state.diagnostics_notify.notified().await;
             }
         })
         .await
@@ -1381,6 +1445,10 @@ fn resolve_workspace_root(file_path: &Path, root_markers: &[String], base_dir: &
     }
 
     base_dir.to_path_buf()
+}
+
+fn workspace_roots_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn resolve_command(command: &str) -> Result<PathBuf> {
@@ -1786,6 +1854,104 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn wait_for_diagnostics_waits_for_settled_publish_notifications() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+        let (mut server_reader, mut server_writer) = tokio::io::split(server_stream);
+        let client = ClientHandle::from_streams(
+            "fake".to_string(),
+            tmp.path().to_path_buf(),
+            None,
+            client_writer,
+            client_reader,
+            None,
+        )
+        .await?;
+
+        let file_path_for_server = file_path.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut server_reader);
+            let message = read_lsp_message(&mut reader).await.expect("initialize");
+            let request = message.expect("initialize request");
+            let id = request.get("id").cloned().expect("request id");
+            write_lsp_message(
+                &mut server_writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "capabilities": {},
+                    },
+                }),
+            )
+            .await
+            .expect("write initialize response");
+            let _ = read_lsp_message(&mut reader).await.expect("initialized");
+            while let Ok(Some(message)) = read_lsp_message(&mut reader).await {
+                if message.get("method").and_then(Value::as_str) != Some("textDocument/didOpen") {
+                    continue;
+                }
+                let uri = path_to_uri(&file_path_for_server).expect("file uri");
+                write_lsp_message(
+                    &mut server_writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": {
+                            "uri": uri,
+                            "diagnostics": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 4 }
+                                },
+                                "severity": 1,
+                                "message": "syntax",
+                            }],
+                        },
+                    }),
+                )
+                .await
+                .expect("write syntax diagnostics");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                write_lsp_message(
+                    &mut server_writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": {
+                            "uri": path_to_uri(&file_path_for_server).expect("file uri"),
+                            "diagnostics": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 5 },
+                                    "end": { "line": 0, "character": 9 }
+                                },
+                                "severity": 1,
+                                "message": "semantic",
+                            }],
+                        },
+                    }),
+                )
+                .await
+                .expect("write semantic diagnostics");
+                break;
+            }
+        });
+
+        client.initialize().await?;
+        client.open_or_change(&file_path).await?;
+        client.wait_for_diagnostics(&file_path, 0).await?;
+        let diagnostics = client.diagnostics_for_path(&file_path).await;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "semantic");
+        assert_eq!(diagnostics[0].range.start.character, 6);
+        Ok(())
+    }
+
     #[test]
     fn normalize_locations_supports_location_links() {
         let items = normalize_location_like(&json!([{
@@ -1915,6 +2081,110 @@ mod tests {
 
         assert!(!manager.is_broken_client(&key).await);
         assert!(!manager.broken_clients.lock().await.contains_key(&key));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_requires_active_client_or_file_scope() -> Result<()> {
+        let tmp = tempdir()?;
+        let manager = SessionManager::new(Some(LspConfig {
+            servers: vec![ServerConfig {
+                id: "rust".to_string(),
+                command: "true".to_string(),
+                args: Vec::new(),
+                extensions: vec![".rs".to_string()],
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: Vec::new(),
+            }],
+        }));
+
+        let err = manager
+            .workspace_symbol("query", tmp.path())
+            .await
+            .expect_err("workspace symbol without active clients");
+        assert!(
+            err.to_string()
+                .contains("No active LSP client available for this workspace")
+        );
+        assert!(manager.broken_clients.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_for_file_reports_connected_and_broken_state() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+        let workspace_root = tmp.path().to_path_buf();
+        let connected_server = ServerConfig {
+            id: "connected".to_string(),
+            command: "true".to_string(),
+            args: Vec::new(),
+            extensions: vec![".rs".to_string()],
+            env: HashMap::new(),
+            initialization: None,
+            root_markers: Vec::new(),
+        };
+        let broken_server = ServerConfig {
+            id: "broken".to_string(),
+            command: "true".to_string(),
+            args: Vec::new(),
+            extensions: vec![".rs".to_string()],
+            env: HashMap::new(),
+            initialization: None,
+            root_markers: Vec::new(),
+        };
+        let manager = SessionManager::new(Some(LspConfig {
+            servers: vec![broken_server.clone(), connected_server.clone()],
+        }));
+
+        let (stream_a, stream_b) = duplex(1024);
+        let (reader, writer) = tokio::io::split(stream_a);
+        let _unused = stream_b;
+        let client = ClientHandle::from_streams(
+            connected_server.id.clone(),
+            workspace_root.clone(),
+            None,
+            writer,
+            reader,
+            None,
+        )
+        .await?;
+        manager.clients.write().await.insert(
+            ClientKey {
+                server_id: connected_server.id.clone(),
+                workspace_root: workspace_root.clone(),
+            },
+            client,
+        );
+        manager.broken_clients.lock().await.insert(
+            ClientKey {
+                server_id: broken_server.id.clone(),
+                workspace_root: workspace_root.clone(),
+            },
+            Instant::now(),
+        );
+
+        let statuses = manager.status_for_file(&file_path, tmp.path()).await;
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(
+            statuses,
+            vec![
+                LspStatus {
+                    server: "broken".to_string(),
+                    workspace_root: workspace_root.clone(),
+                    connected: false,
+                    broken: true,
+                },
+                LspStatus {
+                    server: "connected".to_string(),
+                    workspace_root,
+                    connected: true,
+                    broken: false,
+                },
+            ]
+        );
         Ok(())
     }
 

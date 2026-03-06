@@ -65,6 +65,18 @@ fn to_abs_path(cwd: &Path, path: &Path) -> Option<AbsolutePathBuf> {
     AbsolutePathBuf::resolve_path_against_base(path, cwd).ok()
 }
 
+fn diagnostic_candidate_files(touched_files: &[AbsolutePathBuf]) -> Vec<std::path::PathBuf> {
+    let mut candidate_files = touched_files
+        .iter()
+        .map(AbsolutePathBuf::to_path_buf)
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    candidate_files.sort();
+    candidate_files.dedup();
+    candidate_files.truncate(MAX_LSP_DIAGNOSTIC_FILES);
+    candidate_files
+}
+
 #[async_trait]
 impl ToolHandler for ApplyPatchHandler {
     fn kind(&self) -> ToolKind {
@@ -329,11 +341,7 @@ async fn enrich_apply_patch_output_with_lsp_diagnostics(
         return content;
     };
 
-    let candidate_files = touched_files
-        .iter()
-        .map(AbsolutePathBuf::to_path_buf)
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
+    let candidate_files = diagnostic_candidate_files(touched_files);
     if candidate_files.is_empty() {
         return content;
     }
@@ -665,6 +673,26 @@ mod lsp_output_tests {
             .filter(|line| line.starts_with("ERROR "))
             .count();
         assert_eq!(visible_errors, MAX_LSP_DIAGNOSTICS_PER_FILE);
+    }
+
+    #[test]
+    fn diagnostic_candidate_files_deduplicates_and_limits_files() {
+        let cwd = tempdir().expect("cwd");
+        let mut touched_files = Vec::new();
+        for idx in 0..7 {
+            let file_path = cwd.path().join(format!("src/file-{idx}.rs"));
+            std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&file_path, "fn main() {}\n").expect("write file");
+            touched_files.push(AbsolutePathBuf::try_from(file_path.clone()).expect("abs file"));
+            if idx == 0 {
+                touched_files.push(AbsolutePathBuf::try_from(file_path).expect("dup file"));
+            }
+        }
+
+        let files = diagnostic_candidate_files(&touched_files);
+        assert_eq!(files.len(), MAX_LSP_DIAGNOSTIC_FILES);
+        assert_eq!(files[0], cwd.path().join("src/file-0.rs"));
+        assert_eq!(files[4], cwd.path().join("src/file-4.rs"));
     }
 }
 

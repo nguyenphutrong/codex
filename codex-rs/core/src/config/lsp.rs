@@ -4,6 +4,7 @@ use crate::config::types::LspConfig;
 use crate::config::types::LspServerConfig;
 use crate::config::types::LspServerToml;
 use crate::features::Feature;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io;
 use std::io::ErrorKind;
@@ -131,8 +132,12 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
                 args: vec!["--stdio".to_string()],
                 extensions: [".php"].into_iter().map(str::to_string).collect(),
                 env: HashMap::new(),
-                initialization: None,
-                root_markers: ["composer.json", "composer.lock", ".git"]
+                initialization: Some(json!({
+                    "telemetry": {
+                        "enabled": false,
+                    },
+                })),
+                root_markers: ["composer.json", "composer.lock", ".php-version", ".git"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -279,6 +284,20 @@ mod tests {
         assert_eq!(intelephense.command, "intelephense");
         assert_eq!(intelephense.args, vec!["--stdio"]);
         assert_eq!(intelephense.extensions, vec![".php"]);
+        assert_eq!(
+            intelephense.initialization,
+            Some(json!({
+                "telemetry": {
+                    "enabled": false,
+                },
+            }))
+        );
+        assert!(
+            intelephense
+                .root_markers
+                .iter()
+                .any(|marker| marker == ".php-version")
+        );
 
         let sourcekit = config
             .servers

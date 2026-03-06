@@ -1435,7 +1435,7 @@ fn create_lsp_tool() -> ToolSpec {
             JsonSchema::String {
                 description: Some(
                     "The LSP operation to perform: go_to_definition, find_references, hover, \
-                     document_symbol, workspace_symbol, go_to_implementation, \
+                     document_symbol, workspace_symbol, status, go_to_implementation, \
                      prepare_call_hierarchy, incoming_calls, or outgoing_calls."
                         .to_string(),
                 ),
@@ -1445,7 +1445,7 @@ fn create_lsp_tool() -> ToolSpec {
             "file_path".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Path to the target file. May be absolute or relative to the current working directory."
+                    "Path to the target file. May be absolute or relative to the current working directory. Required for file-scoped operations, status, and optional for scoping workspace_symbol."
                         .to_string(),
                 ),
             },
@@ -1478,7 +1478,7 @@ fn create_lsp_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "lsp".to_string(),
         description:
-            "Queries configured Language Server Protocol servers for definitions, references, hover text, symbols, and call hierarchy."
+            "Queries configured Language Server Protocol servers for definitions, references, hover text, symbols, call hierarchy, and per-file client status."
                 .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
