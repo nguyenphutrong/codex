@@ -193,3 +193,85 @@ fn file_path(args: &LspArgs, base_dir: &std::path::Path) -> Result<PathBuf, Func
     }
     Ok(file_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    #[test]
+    fn position_request_accepts_one_based_coordinates() {
+        let tmp = tempdir().expect("tmp");
+        let file_path = tmp.path().join("main.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write file");
+        let args = LspArgs {
+            operation: LspOperation::Hover,
+            file_path: Some("main.rs".to_string()),
+            line: Some(1),
+            character: Some(1),
+            query: None,
+        };
+
+        let request = position_request(&args, tmp.path()).expect("valid request");
+        assert_eq!(
+            request,
+            PositionRequest {
+                file_path,
+                line: 1,
+                character: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn position_request_rejects_zero_based_coordinates() {
+        let tmp = tempdir().expect("tmp");
+        let file_path = tmp.path().join("main.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write file");
+
+        let zero_line = LspArgs {
+            operation: LspOperation::Hover,
+            file_path: Some("main.rs".to_string()),
+            line: Some(0),
+            character: Some(1),
+            query: None,
+        };
+        assert_eq!(
+            position_request(&zero_line, tmp.path()).expect_err("zero line"),
+            FunctionCallError::RespondToModel("line must be greater than zero".to_string())
+        );
+
+        let zero_character = LspArgs {
+            operation: LspOperation::Hover,
+            file_path: Some("main.rs".to_string()),
+            line: Some(1),
+            character: Some(0),
+            query: None,
+        };
+        assert_eq!(
+            position_request(&zero_character, tmp.path()).expect_err("zero character"),
+            FunctionCallError::RespondToModel("character must be greater than zero".to_string())
+        );
+    }
+
+    #[test]
+    fn file_path_rejects_missing_file() {
+        let tmp = tempdir().expect("tmp");
+        let args = LspArgs {
+            operation: LspOperation::Hover,
+            file_path: Some("missing.rs".to_string()),
+            line: Some(1),
+            character: Some(1),
+            query: None,
+        };
+
+        assert_eq!(
+            file_path(&args, tmp.path()).expect_err("missing file"),
+            FunctionCallError::RespondToModel(format!(
+                "File not found: {}",
+                tmp.path().join("missing.rs").display()
+            ))
+        );
+    }
+}

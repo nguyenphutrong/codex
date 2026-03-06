@@ -1,5 +1,6 @@
 use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::apply_patch;
@@ -358,12 +359,22 @@ fn format_lsp_diagnostics(
     cwd: &Path,
     diagnostics: std::collections::HashMap<std::path::PathBuf, Vec<LspDiagnostic>>,
 ) -> String {
+    let mut seen = HashSet::new();
     let mut entries = diagnostics
         .into_iter()
         .filter_map(|(path, values)| {
             let errors = values
                 .into_iter()
                 .filter(|diagnostic| diagnostic.severity == Some(1))
+                .filter_map(|diagnostic| {
+                    let key = (
+                        path.clone(),
+                        diagnostic.range.start.line,
+                        diagnostic.range.start.character,
+                        diagnostic.message.clone(),
+                    );
+                    seen.insert(key).then_some(diagnostic)
+                })
                 .take(MAX_LSP_DIAGNOSTICS_PER_FILE)
                 .collect::<Vec<_>>();
             (!errors.is_empty()).then_some((path, errors))
@@ -562,6 +573,98 @@ mod lsp_output_tests {
                 file_path.display()
             )
         );
+    }
+
+    #[test]
+    fn format_lsp_diagnostics_deduplicates_errors() {
+        let cwd = tempdir().expect("cwd");
+        let file_path = cwd.path().join("src/main.rs");
+        let output = format_lsp_diagnostics(
+            cwd.path(),
+            HashMap::from([(
+                file_path.clone(),
+                vec![
+                    LspDiagnostic {
+                        path: file_path.clone(),
+                        range: codex_lsp::LspRange {
+                            start: codex_lsp::LspPosition {
+                                line: 4,
+                                character: 2,
+                            },
+                            end: codex_lsp::LspPosition {
+                                line: 4,
+                                character: 3,
+                            },
+                        },
+                        severity: Some(1),
+                        message: "duplicate".to_string(),
+                        source: None,
+                    },
+                    LspDiagnostic {
+                        path: file_path.clone(),
+                        range: codex_lsp::LspRange {
+                            start: codex_lsp::LspPosition {
+                                line: 4,
+                                character: 2,
+                            },
+                            end: codex_lsp::LspPosition {
+                                line: 4,
+                                character: 3,
+                            },
+                        },
+                        severity: Some(1),
+                        message: "duplicate".to_string(),
+                        source: None,
+                    },
+                    LspDiagnostic {
+                        path: file_path,
+                        range: codex_lsp::LspRange {
+                            start: codex_lsp::LspPosition {
+                                line: 5,
+                                character: 1,
+                            },
+                            end: codex_lsp::LspPosition {
+                                line: 5,
+                                character: 2,
+                            },
+                        },
+                        severity: Some(1),
+                        message: "next".to_string(),
+                        source: None,
+                    },
+                ],
+            )]),
+        );
+
+        assert_eq!(output.matches("ERROR [4:2] duplicate").count(), 1);
+        assert!(output.contains("ERROR [5:1] next"));
+    }
+
+    #[test]
+    fn format_lsp_diagnostics_limits_error_count_per_file() {
+        let cwd = tempdir().expect("cwd");
+        let file_path = cwd.path().join("src/main.rs");
+
+        let mut diagnostics = Vec::new();
+        for line in 1..=25 {
+            diagnostics.push(LspDiagnostic {
+                path: file_path.clone(),
+                range: codex_lsp::LspRange {
+                    start: codex_lsp::LspPosition { line, character: 1 },
+                    end: codex_lsp::LspPosition { line, character: 2 },
+                },
+                severity: Some(1),
+                message: format!("error-{line}"),
+                source: None,
+            });
+        }
+
+        let output = format_lsp_diagnostics(cwd.path(), HashMap::from([(file_path, diagnostics)]));
+        let visible_errors = output
+            .lines()
+            .filter(|line| line.starts_with("ERROR "))
+            .count();
+        assert_eq!(visible_errors, MAX_LSP_DIAGNOSTICS_PER_FILE);
     }
 }
 

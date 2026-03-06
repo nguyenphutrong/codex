@@ -159,7 +159,7 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
                 id: "sourcekit".to_string(),
                 command: "sourcekit-lsp".to_string(),
                 args: Vec::new(),
-                extensions: [".swift", ".m", ".mm"]
+                extensions: [".swift", ".m", ".mm", ".objc", ".objcpp"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -255,5 +255,13 @@ mod tests {
                 .env
                 .contains_key("RUST_LOG")
         );
+
+        let sourcekit = config
+            .servers
+            .iter()
+            .find(|server| server.id == "sourcekit")
+            .expect("sourcekit server");
+        assert!(sourcekit.extensions.iter().any(|ext| ext == ".objc"));
+        assert!(sourcekit.extensions.iter().any(|ext| ext == ".objcpp"));
     }
 }

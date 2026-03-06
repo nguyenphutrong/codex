@@ -5,13 +5,13 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
@@ -36,6 +36,7 @@ use url::Url;
 const DIAGNOSTICS_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
+const BROKEN_CLIENT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspConfig {
@@ -100,7 +101,7 @@ pub struct PositionRequest {
 pub struct SessionManager {
     config: Option<Arc<LspConfig>>,
     clients: Arc<RwLock<HashMap<ClientKey, Arc<ClientHandle>>>>,
-    broken_clients: Arc<Mutex<HashSet<ClientKey>>>,
+    broken_clients: Arc<Mutex<HashMap<ClientKey, Instant>>>,
 }
 
 impl SessionManager {
@@ -108,7 +109,7 @@ impl SessionManager {
         Self {
             config: config.map(Arc::new),
             clients: Arc::new(RwLock::new(HashMap::new())),
-            broken_clients: Arc::new(Mutex::new(HashSet::new())),
+            broken_clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -131,9 +132,22 @@ impl SessionManager {
         }
 
         for server_match in matches {
-            let client = self.client_for_match(&server_match).await?;
+            let key = self.client_key(&server_match);
+            let Ok(client) = self.client_for_match(&server_match).await else {
+                continue;
+            };
             let previous_revision = client.diagnostic_revision(&server_match.file_path).await;
-            client.open_or_change(&server_match.file_path).await?;
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP client {} in {} failed to open {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display()
+                );
+                self.mark_client_broken(key).await;
+                continue;
+            }
+
             if wait_for_diagnostics {
                 let _ = client
                     .wait_for_diagnostics(&server_match.file_path, previous_revision)
@@ -342,9 +356,31 @@ impl SessionManager {
 
         let mut results = Vec::new();
         for server_match in matches {
-            let client = self.client_for_match(&server_match).await?;
-            client.open_or_change(&server_match.file_path).await?;
-            let payload = client
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for document_symbol: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP server {} in {} failed to open {} for document_symbol: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display()
+                );
+                self.mark_client_broken(key).await;
+                continue;
+            }
+
+            let payload = match client
                 .send_request(
                     "textDocument/documentSymbol",
                     json!({
@@ -353,7 +389,19 @@ impl SessionManager {
                         },
                     }),
                 )
-                .await?;
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request textDocument/documentSymbol failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    self.mark_client_broken(key).await;
+                    continue;
+                }
+            };
 
             results.push(LspOperationResult {
                 server: server_match.server.id.clone(),
@@ -361,6 +409,12 @@ impl SessionManager {
                 operation: "document_symbol".to_string(),
                 items: normalize_document_symbols(&payload),
             });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No LSP server was able to process document_symbol for this file."
+            ));
         }
 
         Ok(results)
@@ -378,15 +432,39 @@ impl SessionManager {
 
         let mut results = Vec::new();
         for server_match in matches {
-            let client = self.client_for_match(&server_match).await?;
-            let payload = client
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for workspace_symbol: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    continue;
+                }
+            };
+
+            let payload = match client
                 .send_request(
                     "workspace/symbol",
                     json!({
                         "query": query,
                     }),
                 )
-                .await?;
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request workspace/symbol failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    self.mark_client_broken(key).await;
+                    continue;
+                }
+            };
 
             results.push(LspOperationResult {
                 server: server_match.server.id.clone(),
@@ -394,6 +472,12 @@ impl SessionManager {
                 operation: "workspace_symbol".to_string(),
                 items: normalize_symbol_information(&payload),
             });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No LSP server was able to process workspace_symbol for this workspace."
+            ));
         }
 
         Ok(results)
@@ -480,20 +564,55 @@ impl SessionManager {
 
         let mut results = Vec::new();
         for server_match in matches {
-            let client = self.client_for_match(&server_match).await?;
-            client.open_or_change(&server_match.file_path).await?;
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                        operation
+                    );
+                    continue;
+                }
+            };
 
-            let prepared = client
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP server {} in {} failed to open {} for {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display(),
+                    operation
+                );
+                self.mark_client_broken(key.clone()).await;
+                continue;
+            }
+
+            let prepared = match client
                 .send_request(
                     "textDocument/prepareCallHierarchy",
                     json!({
-                        "textDocument": {
-                            "uri": path_to_uri(&server_match.file_path)?,
-                        },
+                    "textDocument": {
+                        "uri": path_to_uri(&server_match.file_path)?,
+                    },
                         "position": to_lsp_position(request.line, request.character),
                     }),
                 )
-                .await?;
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP prepareCallHierarchy request failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                    );
+                    self.mark_client_broken(key.clone()).await;
+                    continue;
+                }
+            };
 
             let Some(first_item) = prepared.as_array().and_then(|items| items.first()).cloned()
             else {
@@ -506,14 +625,26 @@ impl SessionManager {
                 continue;
             };
 
-            let payload = client
+            let payload = match client
                 .send_request(
                     method,
                     json!({
                         "item": first_item,
                     }),
                 )
-                .await?;
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request {method} failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                    );
+                    self.mark_client_broken(key).await;
+                    continue;
+                }
+            };
 
             results.push(LspOperationResult {
                 server: server_match.server.id.clone(),
@@ -523,12 +654,18 @@ impl SessionManager {
             });
         }
 
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No LSP server was able to process this call hierarchy operation."
+            ));
+        }
+
         Ok(results)
     }
 
     async fn run_position_operation<F, Fut>(
         &self,
-        _operation: &str,
+        operation_name: &str,
         request: PositionRequest,
         base_dir: &Path,
         operation: F,
@@ -546,9 +683,33 @@ impl SessionManager {
 
         let mut results = Vec::new();
         for server_match in matches {
-            let client = self.client_for_match(&server_match).await?;
-            client.open_or_change(&server_match.file_path).await?;
-            let payload = operation(
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                        operation_name
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP server {} in {} failed to open {} for {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display(),
+                    operation_name
+                );
+                self.mark_client_broken(key.clone()).await;
+                continue;
+            }
+
+            let payload = match operation(
                 client,
                 PositionRequest {
                     file_path: server_match.file_path.clone(),
@@ -556,7 +717,19 @@ impl SessionManager {
                     character: request.character,
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request for {operation_name} failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                    );
+                    self.mark_client_broken(key).await;
+                    continue;
+                }
+            };
             results.push(RawOperationResult {
                 server: server_match.server.id.clone(),
                 workspace_root: server_match.workspace_root,
@@ -564,18 +737,19 @@ impl SessionManager {
             });
         }
 
+        if results.is_empty() {
+            return Err(anyhow!("No LSP server was able to process this operation."));
+        }
+
         Ok(results)
     }
 
     async fn client_for_match(&self, server_match: &ServerMatch) -> Result<Arc<ClientHandle>> {
-        let key = ClientKey {
-            server_id: server_match.server.id.clone(),
-            workspace_root: server_match.workspace_root.clone(),
-        };
+        let key = self.client_key(server_match);
 
-        if self.broken_clients.lock().await.contains(&key) {
+        if self.is_broken_client(&key).await {
             return Err(anyhow!(
-                "LSP server {} is unavailable for {}",
+                "LSP server {} is temporarily unavailable for {}. Retry later.",
                 key.server_id,
                 key.workspace_root.display()
             ));
@@ -585,22 +759,53 @@ impl SessionManager {
             return Ok(existing);
         }
 
-        let client = ClientHandle::spawn(server_match.server.clone(), key.workspace_root.clone())
-            .await
-            .map_err(|err| {
+        let client = match ClientHandle::spawn(
+            server_match.server.clone(),
+            key.workspace_root.clone(),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(err) => {
                 warn!(
                     "failed to start LSP server {} in {}: {err:#}",
                     key.server_id,
                     key.workspace_root.display()
                 );
-                err
-            })?;
+                self.mark_client_broken(key.clone()).await;
+                return Err(err);
+            }
+        };
 
         self.clients
             .write()
             .await
             .insert(key.clone(), client.clone());
         Ok(client)
+    }
+
+    fn client_key(&self, server_match: &ServerMatch) -> ClientKey {
+        ClientKey {
+            server_id: server_match.server.id.clone(),
+            workspace_root: server_match.workspace_root.clone(),
+        }
+    }
+
+    async fn is_broken_client(&self, key: &ClientKey) -> bool {
+        let mut broken_clients = self.broken_clients.lock().await;
+        match broken_clients.get(key) {
+            Some(since) if since.elapsed() <= BROKEN_CLIENT_TTL => true,
+            Some(_) => {
+                broken_clients.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    async fn mark_client_broken(&self, key: ClientKey) {
+        self.clients.write().await.remove(&key);
+        self.broken_clients.lock().await.insert(key, Instant::now());
     }
 
     async fn matching_server_matches(&self, file_path: &Path, base_dir: &Path) -> Vec<ServerMatch> {
@@ -1480,6 +1685,7 @@ fn range_to_value(range: &LspRange) -> Value {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
     use tokio::io::duplex;
@@ -1618,5 +1824,242 @@ mod tests {
             items[1]["container_name"],
             Value::String("Parent".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn client_for_match_marks_spawn_failures_as_broken() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+
+        let manager = SessionManager::new(Some(LspConfig {
+            servers: vec![ServerConfig {
+                id: "broken".to_string(),
+                command: tmp.path().to_string_lossy().into_owned(),
+                args: Vec::new(),
+                extensions: vec![".rs".to_string()],
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: Vec::new(),
+            }],
+        }));
+
+        let server_match = manager
+            .matching_server_matches(&file_path, tmp.path())
+            .await
+            .into_iter()
+            .next()
+            .expect("server match");
+        let key = manager.client_key(&server_match);
+
+        manager
+            .client_for_match(&server_match)
+            .await
+            .expect_err("spawn failure");
+        assert!(manager.is_broken_client(&key).await);
+
+        let retry_error = manager
+            .client_for_match(&server_match)
+            .await
+            .expect_err("broken client");
+        assert!(retry_error.to_string().contains("temporarily unavailable"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_for_match_marks_initialize_failures_as_broken() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+
+        let manager = SessionManager::new(Some(LspConfig {
+            servers: vec![ServerConfig {
+                id: "broken".to_string(),
+                command: "true".to_string(),
+                args: Vec::new(),
+                extensions: vec![".rs".to_string()],
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: Vec::new(),
+            }],
+        }));
+
+        let server_match = manager
+            .matching_server_matches(&file_path, tmp.path())
+            .await
+            .into_iter()
+            .next()
+            .expect("server match");
+        let key = manager.client_key(&server_match);
+
+        manager
+            .client_for_match(&server_match)
+            .await
+            .expect_err("initialize failure");
+        assert!(manager.is_broken_client(&key).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broken_client_entries_expire_after_ttl() -> Result<()> {
+        let manager = SessionManager::default();
+        let key = ClientKey {
+            server_id: "server".to_string(),
+            workspace_root: PathBuf::from("/tmp/workspace"),
+        };
+        manager.broken_clients.lock().await.insert(
+            key.clone(),
+            Instant::now() - BROKEN_CLIENT_TTL - Duration::from_secs(1),
+        );
+
+        assert!(!manager.is_broken_client(&key).await);
+        assert!(!manager.broken_clients.lock().await.contains_key(&key));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definition_best_effort_returns_healthy_server_results() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+
+        let broken_server = ServerConfig {
+            id: "broken".to_string(),
+            command: "true".to_string(),
+            args: Vec::new(),
+            extensions: vec![".rs".to_string()],
+            env: HashMap::new(),
+            initialization: None,
+            root_markers: Vec::new(),
+        };
+        let healthy_server = ServerConfig {
+            id: "healthy".to_string(),
+            command: "true".to_string(),
+            args: Vec::new(),
+            extensions: vec![".rs".to_string()],
+            env: HashMap::new(),
+            initialization: None,
+            root_markers: Vec::new(),
+        };
+        let manager = SessionManager::new(Some(LspConfig {
+            servers: vec![broken_server.clone(), healthy_server.clone()],
+        }));
+
+        let (broken_client_stream, broken_server_stream) = duplex(16 * 1024);
+        let (broken_client_reader, broken_client_writer) = tokio::io::split(broken_client_stream);
+        let (mut broken_server_reader, mut broken_server_writer) =
+            tokio::io::split(broken_server_stream);
+        let broken_client = ClientHandle::from_streams(
+            broken_server.id.clone(),
+            tmp.path().to_path_buf(),
+            None,
+            broken_client_writer,
+            broken_client_reader,
+            None,
+        )
+        .await?;
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut broken_server_reader);
+            while let Ok(Some(message)) = read_lsp_message(&mut reader).await {
+                let Some(id) = message.get("id").cloned() else {
+                    continue;
+                };
+                write_lsp_message(
+                    &mut broken_server_writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "message": "boom",
+                        },
+                    }),
+                )
+                .await
+                .expect("write broken response");
+            }
+        });
+
+        let (healthy_client_stream, healthy_server_stream) = duplex(16 * 1024);
+        let (healthy_client_reader, healthy_client_writer) =
+            tokio::io::split(healthy_client_stream);
+        let (mut healthy_server_reader, mut healthy_server_writer) =
+            tokio::io::split(healthy_server_stream);
+        let healthy_client = ClientHandle::from_streams(
+            healthy_server.id.clone(),
+            tmp.path().to_path_buf(),
+            None,
+            healthy_client_writer,
+            healthy_client_reader,
+            None,
+        )
+        .await?;
+
+        let file_uri = path_to_uri(&file_path)?;
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut healthy_server_reader);
+            while let Ok(Some(message)) = read_lsp_message(&mut reader).await {
+                let Some(id) = message.get("id").cloned() else {
+                    continue;
+                };
+                write_lsp_message(
+                    &mut healthy_server_writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": [{
+                            "uri": file_uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 4 }
+                            }
+                        }],
+                    }),
+                )
+                .await
+                .expect("write healthy response");
+            }
+        });
+
+        let workspace_root = tmp.path().to_path_buf();
+        manager.clients.write().await.insert(
+            ClientKey {
+                server_id: broken_server.id.clone(),
+                workspace_root: workspace_root.clone(),
+            },
+            broken_client,
+        );
+        manager.clients.write().await.insert(
+            ClientKey {
+                server_id: healthy_server.id.clone(),
+                workspace_root: workspace_root.clone(),
+            },
+            healthy_client,
+        );
+
+        let request = PositionRequest {
+            file_path: file_path.clone(),
+            line: 1,
+            character: 1,
+        };
+
+        let results = manager.definition(request.clone(), tmp.path()).await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].server, "healthy");
+        assert_eq!(
+            results[0].items[0]["path"],
+            Value::String(file_path.to_string_lossy().into_owned())
+        );
+
+        let broken_key = ClientKey {
+            server_id: broken_server.id,
+            workspace_root: workspace_root.clone(),
+        };
+        assert!(manager.is_broken_client(&broken_key).await);
+
+        let retried_results = manager.definition(request, tmp.path()).await?;
+        assert_eq!(retried_results.len(), 1);
+        assert_eq!(retried_results[0].server, "healthy");
+        Ok(())
     }
 }
