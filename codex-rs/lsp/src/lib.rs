@@ -572,6 +572,12 @@ mod tests {
             None,
         )
         .await?;
+        broken_client
+            .set_server_capabilities(crate::client::ServerCapabilities {
+                has_definition: true,
+                ..Default::default()
+            })
+            .await;
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(&mut broken_server_reader);
@@ -608,6 +614,12 @@ mod tests {
             None,
         )
         .await?;
+        healthy_client
+            .set_server_capabilities(crate::client::ServerCapabilities {
+                has_definition: true,
+                ..Default::default()
+            })
+            .await;
 
         let file_uri = path_to_uri(&file_path)?;
         tokio::spawn(async move {
@@ -732,6 +744,102 @@ mod tests {
         let versions = client.state.opened_versions.lock().await;
         let version = versions.get(&file_path).expect("opened version");
         assert_eq!(*version, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definition_returns_clear_error_when_server_lacks_capability() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+        let request_count = Arc::new(Mutex::new(0usize));
+        let request_count_for_spawn = request_count.clone();
+
+        let manager = SessionManager::with_options(
+            Some(LspConfig {
+                servers: vec![ServerConfig {
+                    id: "rust".to_string(),
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    extensions: vec![".rs".to_string()],
+                    env: HashMap::new(),
+                    initialization: None,
+                    root_markers: Vec::new(),
+                }],
+            }),
+            move |server, workspace_root| {
+                let request_count = request_count_for_spawn.clone();
+                Box::pin(async move {
+                    let (client_stream, server_stream) = duplex(16 * 1024);
+                    let (client_reader, client_writer) = tokio::io::split(client_stream);
+                    let (mut server_reader, mut server_writer) = tokio::io::split(server_stream);
+                    let client = ClientHandle::from_streams(
+                        server.id,
+                        workspace_root,
+                        server.initialization,
+                        client_writer,
+                        client_reader,
+                        None,
+                    )
+                    .await?;
+
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(&mut server_reader);
+                        let request = read_lsp_message(&mut reader)
+                            .await
+                            .expect("initialize")
+                            .expect("initialize request");
+                        let id = request.get("id").cloned().expect("request id");
+                        write_lsp_message(
+                            &mut server_writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "capabilities": {
+                                        "definitionProvider": false,
+                                    },
+                                },
+                            }),
+                        )
+                        .await
+                        .expect("write initialize response");
+                        let _ = read_lsp_message(&mut reader).await.expect("initialized");
+
+                        while let Ok(Some(message)) = read_lsp_message(&mut reader).await {
+                            if message.get("id").is_some() {
+                                *request_count.lock().await += 1;
+                            }
+                        }
+                    });
+
+                    client.initialize().await?;
+                    Ok(client)
+                })
+            },
+            [
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+            ],
+        );
+
+        let err = manager
+            .definition(
+                PositionRequest {
+                    file_path: file_path.clone(),
+                    line: 1,
+                    character: 1,
+                },
+                tmp.path(),
+            )
+            .await
+            .expect_err("definition should be unsupported");
+        assert!(
+            err.to_string()
+                .contains("LSP server does not support definition requests")
+        );
+        assert_eq!(*request_count.lock().await, 0);
         Ok(())
     }
 
