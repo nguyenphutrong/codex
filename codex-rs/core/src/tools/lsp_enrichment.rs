@@ -74,8 +74,11 @@ pub(crate) async fn capture_git_status_snapshot(cwd: &Path) -> Option<GitStatusS
             (!root.is_empty()).then(|| PathBuf::from(root))
         })?;
 
-    let status_output =
-        run_git(cwd, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).await?;
+    let status_output = run_git(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await?;
     Some(GitStatusSnapshot {
         repo_root: repo_root.clone(),
         records: parse_git_status_records(&repo_root, &status_output),

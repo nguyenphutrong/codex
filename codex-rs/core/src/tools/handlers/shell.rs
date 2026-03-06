@@ -443,7 +443,9 @@ impl ShellHandler {
         let changed_files = if out.is_ok() {
             match (
                 before_git_snapshot.as_ref(),
-                capture_git_status_snapshot(exec_params.cwd.as_path()).await.as_ref(),
+                capture_git_status_snapshot(exec_params.cwd.as_path())
+                    .await
+                    .as_ref(),
             ) {
                 (Some(before), Some(after)) => diff_git_status_snapshots(before, after),
                 _ => Vec::new(),
