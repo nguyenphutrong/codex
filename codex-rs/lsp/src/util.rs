@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tokio::time::Duration;
 use url::Url;
 
+use crate::client::ServerCapabilities;
 use crate::client::TextDocumentChangeKind;
 use crate::client::TextDocumentSaveCapabilities;
 use crate::client::TextDocumentSyncCapabilities;
@@ -98,6 +99,19 @@ pub(crate) fn parse_sync_capabilities(
     }
 }
 
+pub(crate) fn parse_server_capabilities(capabilities: Option<&Value>) -> ServerCapabilities {
+    let Some(capabilities) = capabilities else {
+        return ServerCapabilities::default();
+    };
+
+    ServerCapabilities {
+        has_definition: capability_supported(capabilities.get("definitionProvider")),
+        has_hover: capability_supported(capabilities.get("hoverProvider")),
+        has_references: capability_supported(capabilities.get("referencesProvider")),
+        has_diagnostics: capability_supported(capabilities.get("diagnosticProvider")),
+    }
+}
+
 fn parse_change_kind(change: Option<u64>) -> TextDocumentChangeKind {
     match change {
         Some(0) => TextDocumentChangeKind::None,
@@ -120,6 +134,14 @@ fn parse_save_capabilities(save: Option<&Value>) -> TextDocumentSaveCapabilities
                 .unwrap_or(false),
         },
         _ => TextDocumentSaveCapabilities::default(),
+    }
+}
+
+fn capability_supported(capability: Option<&Value>) -> bool {
+    match capability {
+        Some(Value::Bool(supported)) => *supported,
+        Some(Value::Null) | None => false,
+        Some(_) => true,
     }
 }
 
@@ -179,6 +201,7 @@ pub(crate) fn language_id_for_path(path: &Path) -> &'static str {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -212,5 +235,27 @@ mod tests {
 
         let root = resolve_workspace_root(&file_path, &["Cargo.toml".to_string()], &workspace);
         assert_eq!(root, workspace);
+    }
+
+    #[test]
+    fn parse_server_capabilities_reads_supported_requests() {
+        let capabilities = parse_server_capabilities(Some(&json!({
+            "definitionProvider": true,
+            "hoverProvider": { "workDoneProgress": true },
+            "referencesProvider": false,
+            "diagnosticProvider": {
+                "interFileDependencies": false,
+            },
+        })));
+
+        assert_eq!(
+            capabilities,
+            ServerCapabilities {
+                has_definition: true,
+                has_hover: true,
+                has_references: false,
+                has_diagnostics: true,
+            }
+        );
     }
 }

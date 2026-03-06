@@ -244,6 +244,7 @@ impl SessionManager {
             request,
             base_dir,
             |client, req| async move {
+                client.ensure_definition_support().await?;
                 client
                     .send_request(
                         "textDocument/definition",
@@ -281,6 +282,7 @@ impl SessionManager {
             request,
             base_dir,
             |client, req| async move {
+                client.ensure_references_support().await?;
                 client
                     .send_request(
                         "textDocument/references",
@@ -317,6 +319,7 @@ impl SessionManager {
         base_dir: &Path,
     ) -> Result<Vec<LspOperationResult>> {
         self.run_position_operation("hover", request, base_dir, |client, req| async move {
+            client.ensure_hover_support().await?;
             client
                 .send_request(
                     "textDocument/hover",
@@ -758,6 +761,7 @@ impl SessionManager {
         }
 
         let mut results = Vec::new();
+        let mut unsupported_capability_error = None;
         for server_match in matches {
             let key = self.client_key(&server_match);
             let client = match self.client_for_match(&server_match).await {
@@ -800,6 +804,10 @@ impl SessionManager {
             {
                 Ok(payload) => payload,
                 Err(err) => {
+                    if err.to_string().starts_with("LSP server does not support ") {
+                        unsupported_capability_error = Some(err);
+                        continue;
+                    }
                     warn!(
                         "LSP request for {operation_name} failed for {} in {}: {err:#}",
                         key.server_id,
@@ -820,6 +828,9 @@ impl SessionManager {
         }
 
         if results.is_empty() {
+            if let Some(err) = unsupported_capability_error {
+                return Err(err);
+            }
             return Err(anyhow!("No LSP server was able to process this operation."));
         }
 

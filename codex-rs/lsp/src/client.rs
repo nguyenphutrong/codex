@@ -3,6 +3,7 @@ use crate::protocol::read_lsp_message;
 use crate::protocol::write_lsp_message;
 use crate::types::LspDiagnostic;
 use crate::util::language_id_for_path;
+use crate::util::parse_server_capabilities;
 use crate::util::parse_sync_capabilities;
 use crate::util::path_to_uri;
 use crate::util::resolve_command;
@@ -72,6 +73,14 @@ impl Default for TextDocumentSyncCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ServerCapabilities {
+    pub(crate) has_definition: bool,
+    pub(crate) has_hover: bool,
+    pub(crate) has_references: bool,
+    pub(crate) has_diagnostics: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CachedDiagnostics {
     pub(crate) diagnostics: Vec<LspDiagnostic>,
@@ -86,6 +95,7 @@ pub(crate) struct ClientState {
     pub(crate) diagnostics: RwLock<HashMap<PathBuf, CachedDiagnostics>>,
     pub(crate) opened_versions: Mutex<HashMap<PathBuf, i32>>,
     pub(crate) sync_capabilities: RwLock<TextDocumentSyncCapabilities>,
+    pub(crate) server_capabilities: RwLock<ServerCapabilities>,
     pub(crate) next_request_id: AtomicU64,
     pub(crate) next_state_revision: AtomicU64,
     pub(crate) diagnostics_notify: Notify,
@@ -156,6 +166,7 @@ impl ClientHandle {
             diagnostics: RwLock::new(HashMap::new()),
             opened_versions: Mutex::new(HashMap::new()),
             sync_capabilities: RwLock::new(TextDocumentSyncCapabilities::default()),
+            server_capabilities: RwLock::new(ServerCapabilities::default()),
             next_request_id: AtomicU64::new(0),
             next_state_revision: AtomicU64::new(0),
             diagnostics_notify: Notify::new(),
@@ -243,6 +254,10 @@ impl ClientHandle {
         .await
         .context("initialize timed out")??;
         self.set_sync_capabilities(parse_sync_capabilities(
+            initialize_result.get("capabilities"),
+        ))
+        .await;
+        self.set_server_capabilities(parse_server_capabilities(
             initialize_result.get("capabilities"),
         ))
         .await;
@@ -354,6 +369,27 @@ impl ClientHandle {
             None
         };
         self.send_did_save(file_path, text.as_deref()).await
+    }
+
+    pub(crate) async fn ensure_definition_support(&self) -> Result<()> {
+        self.ensure_capability(
+            self.state.server_capabilities.read().await.has_definition,
+            "definition",
+        )
+    }
+
+    pub(crate) async fn ensure_hover_support(&self) -> Result<()> {
+        self.ensure_capability(
+            self.state.server_capabilities.read().await.has_hover,
+            "hover",
+        )
+    }
+
+    pub(crate) async fn ensure_references_support(&self) -> Result<()> {
+        self.ensure_capability(
+            self.state.server_capabilities.read().await.has_references,
+            "references",
+        )
     }
 
     pub(crate) async fn diagnostics_for_path(&self, file_path: &Path) -> Vec<LspDiagnostic> {
@@ -585,6 +621,10 @@ impl ClientHandle {
         *self.state.sync_capabilities.write().await = capabilities;
     }
 
+    pub(crate) async fn set_server_capabilities(&self, capabilities: ServerCapabilities) {
+        *self.state.server_capabilities.write().await = capabilities;
+    }
+
     pub(crate) async fn mark_touch_pending(&self, file_path: &Path) -> u64 {
         let revision = self.next_state_revision();
         let mut diagnostics = self.state.diagnostics.write().await;
@@ -626,6 +666,15 @@ impl ClientHandle {
         {
             let _ = child.start_kill();
         }
+    }
+
+    fn ensure_capability(&self, supported: bool, capability_name: &str) -> Result<()> {
+        if supported {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "LSP server does not support {capability_name} requests."
+        ))
     }
 }
 
