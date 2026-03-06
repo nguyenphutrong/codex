@@ -29,12 +29,26 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::AsyncWriteExt;
     use tokio::io::BufReader;
     use tokio::io::duplex;
+    use tokio::sync::Mutex;
     use tokio::time::Duration;
+
+    fn test_session_manager(config: Option<LspConfig>) -> SessionManager {
+        SessionManager::with_options(
+            config,
+            |server, workspace_root| Box::pin(ClientHandle::spawn(server, workspace_root)),
+            [
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+            ],
+        )
+    }
 
     #[tokio::test]
     async fn read_and_write_lsp_messages_round_trip() -> Result<()> {
@@ -283,7 +297,7 @@ mod tests {
         let file_path = tmp.path().join("main.rs");
         fs::write(&file_path, "fn main() {}\n").await?;
 
-        let manager = SessionManager::new(Some(LspConfig {
+        let manager = test_session_manager(Some(LspConfig {
             servers: vec![ServerConfig {
                 id: "broken".to_string(),
                 command: tmp.path().to_string_lossy().into_owned(),
@@ -308,6 +322,8 @@ mod tests {
             .await
             .expect_err("spawn failure");
 
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         let health = manager
             .client_health
             .read()
@@ -316,12 +332,13 @@ mod tests {
             .cloned()
             .expect("health entry");
         assert_eq!(health.state, LspClientState::Broken);
+        assert!(health.permanent_broken);
 
         let retry_error = manager
             .client_for_match(&server_match)
             .await
             .expect_err("broken client");
-        assert!(retry_error.to_string().contains("temporarily unavailable"));
+        assert!(retry_error.to_string().contains("permanently broken"));
         Ok(())
     }
 
@@ -331,7 +348,7 @@ mod tests {
         let file_path = tmp.path().join("main.rs");
         fs::write(&file_path, "fn main() {}\n").await?;
 
-        let manager = SessionManager::new(Some(LspConfig {
+        let manager = test_session_manager(Some(LspConfig {
             servers: vec![ServerConfig {
                 id: "broken".to_string(),
                 command: "true".to_string(),
@@ -356,6 +373,8 @@ mod tests {
             .await
             .expect_err("initialize failure");
 
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         let health = manager
             .client_health
             .read()
@@ -364,6 +383,7 @@ mod tests {
             .cloned()
             .expect("health entry");
         assert_eq!(health.state, LspClientState::Broken);
+        assert!(health.permanent_broken);
         Ok(())
     }
 
@@ -613,7 +633,10 @@ mod tests {
             .get(&broken_key)
             .cloned()
             .expect("health");
-        assert_eq!(health.state, LspClientState::Broken);
+        assert!(matches!(
+            health.state,
+            LspClientState::Broken | LspClientState::Starting
+        ));
 
         let retried_results = manager.definition(request, tmp.path()).await?;
         assert_eq!(retried_results.len(), 1);
@@ -670,73 +693,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_crash_marks_client_broken_on_failed_request() -> Result<()> {
+    async fn server_crash_restarts_and_reopens_tracked_documents() -> Result<()> {
         let tmp = tempdir()?;
         let file_path = tmp.path().join("main.rs");
+        let helper_path = tmp.path().join("helper.rs");
         fs::write(&file_path, "fn main() {}\n").await?;
+        fs::write(&helper_path, "pub fn helper() {}\n").await?;
+        let restarted_documents = Arc::new(Mutex::new(Vec::new()));
+        let spawn_count = Arc::new(Mutex::new(0usize));
+        let restarted_documents_for_spawn = restarted_documents.clone();
+        let spawn_count_for_spawn = spawn_count.clone();
 
-        let manager = SessionManager::new(Some(LspConfig {
-            servers: vec![ServerConfig {
-                id: "crasher".to_string(),
-                command: "true".to_string(),
-                args: Vec::new(),
-                extensions: vec![".rs".to_string()],
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: Vec::new(),
-            }],
-        }));
+        let manager = SessionManager::with_options(
+            Some(LspConfig {
+                servers: vec![ServerConfig {
+                    id: "crasher".to_string(),
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    extensions: vec![".rs".to_string()],
+                    env: HashMap::new(),
+                    initialization: None,
+                    root_markers: Vec::new(),
+                }],
+            }),
+            move |server, workspace_root| {
+                let restarted_documents = restarted_documents_for_spawn.clone();
+                let spawn_count = spawn_count_for_spawn.clone();
+                Box::pin(async move {
+                    let spawn_attempt = {
+                        let mut count = spawn_count.lock().await;
+                        *count += 1;
+                        *count
+                    };
+                    let (client_stream, server_stream) = duplex(16 * 1024);
+                    let (client_reader, client_writer) = tokio::io::split(client_stream);
+                    let (mut server_reader, mut server_writer) = tokio::io::split(server_stream);
+                    let client = ClientHandle::from_streams(
+                        server.id,
+                        workspace_root,
+                        server.initialization,
+                        client_writer,
+                        client_reader,
+                        None,
+                    )
+                    .await?;
 
-        let (stream_a, server_stream) = duplex(16 * 1024);
-        let (client_reader, client_writer) = tokio::io::split(stream_a);
-        let (mut server_reader, server_writer) = tokio::io::split(server_stream);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(&mut server_reader);
+                        let request = read_lsp_message(&mut reader)
+                            .await
+                            .expect("initialize")
+                            .expect("initialize request");
+                        let id = request.get("id").cloned().expect("request id");
+                        write_lsp_message(
+                            &mut server_writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "capabilities": {},
+                                },
+                            }),
+                        )
+                        .await
+                        .expect("write initialize response");
+                        let _ = read_lsp_message(&mut reader).await.expect("initialized");
 
-        let workspace_root = tmp.path().to_path_buf();
-        let client = ClientHandle::from_streams(
-            "crasher".to_string(),
-            workspace_root.clone(),
-            None,
-            client_writer,
-            client_reader,
-            None,
-        )
-        .await?;
+                        let mut opened = Vec::new();
+                        while let Ok(Some(message)) = read_lsp_message(&mut reader).await {
+                            if message.get("method").and_then(Value::as_str)
+                                != Some("textDocument/didOpen")
+                            {
+                                continue;
+                            }
+                            let uri = message["params"]["textDocument"]["uri"]
+                                .as_str()
+                                .expect("didOpen uri")
+                                .to_string();
+                            opened.push(uri);
 
-        // Server reads and responds to open_or_change, then drops to simulate crash.
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(&mut server_reader);
-            // Read all notifications/requests and then close.
-            while let Ok(Some(_)) = read_lsp_message(&mut reader).await {}
-            drop(server_writer);
-        });
+                            if spawn_attempt == 1 && opened.len() == 2 {
+                                break;
+                            }
 
+                            if spawn_attempt == 2 && opened.len() == 2 {
+                                *restarted_documents.lock().await = opened.clone();
+                            }
+                        }
+                    });
+
+                    client.initialize().await?;
+
+                    Ok(client)
+                })
+            },
+            [
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+            ],
+        );
+
+        manager.touch_file(&file_path, tmp.path(), false).await?;
+        manager.touch_file(&helper_path, tmp.path(), false).await?;
         let key = ClientKey {
             server_id: "crasher".to_string(),
-            workspace_root: workspace_root.clone(),
+            workspace_root: tmp.path().to_path_buf(),
         };
-        manager.clients.write().await.insert(key.clone(), client);
-        {
-            let mut health = manager.client_health.write().await;
-            let entry = health.entry(key.clone()).or_default();
-            entry.state = LspClientState::Connected;
-        }
+        manager
+            .mark_client_broken_and_restart(key.clone(), "simulated crash".to_string())
+            .await;
 
-        let server_match = manager
-            .matching_server_matches(&file_path, tmp.path())
-            .await
-            .into_iter()
-            .next()
-            .expect("server match");
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // open_or_change will try to send notifications over the writer, which
-        // will fail after the server side drops its reader. The manager should
-        // then mark the client broken.
-        let _ = manager.client_for_match(&server_match).await;
+        let reopened = restarted_documents.lock().await.clone();
+        let mut expected = vec![path_to_uri(&file_path)?, path_to_uri(&helper_path)?];
+        expected.sort();
+        let mut reopened_sorted = reopened;
+        reopened_sorted.sort();
+        assert_eq!(reopened_sorted, expected);
 
-        // Give a moment for the reader task to notice the closed stream.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // The client's open_or_change likely failed, causing mark_client_broken.
         let health = manager
             .client_health
             .read()
@@ -744,14 +820,8 @@ mod tests {
             .get(&key)
             .cloned()
             .expect("health");
-        assert!(
-            matches!(
-                health.state,
-                LspClientState::Broken | LspClientState::Connected
-            ),
-            "state should be Broken or Connected (if request didn't fail yet), got {:?}",
-            health.state
-        );
+        assert_eq!(health.state, LspClientState::Connected);
+        assert_eq!(*spawn_count.lock().await, 2);
         Ok(())
     }
 

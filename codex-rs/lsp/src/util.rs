@@ -5,6 +5,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(test)]
 use tokio::time::Duration;
 use url::Url;
 
@@ -12,8 +13,11 @@ use crate::client::TextDocumentChangeKind;
 use crate::client::TextDocumentSaveCapabilities;
 use crate::client::TextDocumentSyncCapabilities;
 
+#[cfg(test)]
 pub(crate) const CLIENT_BACKOFF_FIRST_FAILURE: Duration = Duration::from_secs(30);
+#[cfg(test)]
 pub(crate) const CLIENT_BACKOFF_SECOND_FAILURE: Duration = Duration::from_secs(120);
+#[cfg(test)]
 pub(crate) const CLIENT_BACKOFF_MAX_FAILURE: Duration = Duration::from_secs(600);
 
 pub(crate) fn resolve_absolute_path(base_dir: &Path, file_path: &Path) -> PathBuf {
@@ -50,6 +54,7 @@ pub(crate) fn workspace_roots_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
+#[cfg(test)]
 pub(crate) fn backoff_for_failure(failure_count: u32) -> Duration {
     match failure_count {
         0 | 1 => CLIENT_BACKOFF_FIRST_FAILURE,
