@@ -1422,6 +1422,7 @@ fn language_id_for_path(path: &Path) -> &'static str {
         Some("cts") => "typescript",
         Some("mjs") => "javascript",
         Some("cjs") => "javascript",
+        Some("php") => "php",
         Some("py") | Some("pyi") => "python",
         Some("go") => "go",
         Some("c") => "c",

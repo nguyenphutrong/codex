@@ -26,7 +26,7 @@ lsp = true
 enabled = true
 ```
 
-Codex ships a small built-in server catalog for `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`, and `sourcekit-lsp`. A server is only activated when its command is available locally.
+Codex ships a small built-in server catalog for `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`, `sourcekit-lsp`, and `intelephense`. A server is only activated when its command is available locally.
 
 You can override a built-in server or add a custom one:
 

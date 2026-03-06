@@ -124,6 +124,21 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
             },
         ),
         (
+            "intelephense",
+            LspServerConfig {
+                id: "intelephense".to_string(),
+                command: "intelephense".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [".php"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["composer.json", "composer.lock", ".git"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
             "pyright",
             LspServerConfig {
                 id: "pyright".to_string(),
@@ -255,6 +270,15 @@ mod tests {
                 .env
                 .contains_key("RUST_LOG")
         );
+
+        let intelephense = config
+            .servers
+            .iter()
+            .find(|server| server.id == "intelephense")
+            .expect("intelephense built-in");
+        assert_eq!(intelephense.command, "intelephense");
+        assert_eq!(intelephense.args, vec!["--stdio"]);
+        assert_eq!(intelephense.extensions, vec![".php"]);
 
         let sourcekit = config
             .servers
