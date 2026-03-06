@@ -1,0 +1,1050 @@
+use crate::client::ClientHandle;
+use crate::normalize::normalize_call_hierarchy_calls;
+use crate::normalize::normalize_call_hierarchy_items;
+use crate::normalize::normalize_document_symbols;
+use crate::normalize::normalize_hover;
+use crate::normalize::normalize_location_like;
+use crate::normalize::normalize_symbol_information;
+use crate::types::LspClientState;
+use crate::types::LspConfig;
+use crate::types::LspDiagnostic;
+use crate::types::LspOperationResult;
+use crate::types::LspStatus;
+use crate::types::PositionRequest;
+use crate::types::ServerConfig;
+use crate::util::backoff_for_failure;
+use crate::util::path_to_uri;
+use crate::util::resolve_absolute_path;
+use crate::util::resolve_command;
+use crate::util::resolve_workspace_root;
+use crate::util::to_lsp_position;
+use crate::util::workspace_roots_overlap;
+use anyhow::Result;
+use anyhow::anyhow;
+use serde_json::Value;
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+use std::time::SystemTime;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tracing::warn;
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionManager {
+    config: Option<Arc<LspConfig>>,
+    pub(crate) clients: Arc<RwLock<HashMap<ClientKey, Arc<ClientHandle>>>>,
+    pub(crate) client_health: Arc<RwLock<HashMap<ClientKey, ClientHealth>>>,
+    client_locks: Arc<Mutex<HashMap<ClientKey, Arc<Mutex<()>>>>>,
+}
+
+impl SessionManager {
+    pub fn new(config: Option<LspConfig>) -> Self {
+        Self {
+            config: config.map(Arc::new),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            client_health: Arc::new(RwLock::new(HashMap::new())),
+            client_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn has_server_for_file(&self, file_path: &Path, base_dir: &Path) -> bool {
+        !self
+            .matching_server_matches(file_path, base_dir)
+            .await
+            .is_empty()
+    }
+
+    pub async fn touch_file(
+        &self,
+        file_path: &Path,
+        base_dir: &Path,
+        wait_for_diagnostics: bool,
+    ) -> Result<()> {
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        if matches.is_empty() {
+            return Ok(());
+        }
+
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let Ok(client) = self.client_for_match(&server_match).await else {
+                continue;
+            };
+            let touch_revision = match client.open_or_change(&server_match.file_path).await {
+                Ok(touch_revision) => touch_revision,
+                Err(err) => {
+                    warn!(
+                        "LSP client {} in {} failed to open {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                        server_match.file_path.display()
+                    );
+                    self.mark_client_broken(key, err.to_string()).await;
+                    continue;
+                }
+            };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            if wait_for_diagnostics
+                && let Err(err) = client
+                    .wait_for_diagnostics(&server_match.file_path, touch_revision)
+                    .await
+            {
+                warn!(
+                    "LSP client {} in {} did not receive fresh diagnostics for {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn diagnostics_for_paths(
+        &self,
+        paths: &[PathBuf],
+        base_dir: &Path,
+    ) -> HashMap<PathBuf, Vec<LspDiagnostic>> {
+        let mut aggregated = HashMap::new();
+
+        for file_path in paths {
+            let matches = self.matching_server_matches(file_path, base_dir).await;
+            for server_match in matches {
+                let Ok(client) = self.client_for_match(&server_match).await else {
+                    continue;
+                };
+                let diagnostics = client.diagnostics_for_path(&server_match.file_path).await;
+                if diagnostics.is_empty() {
+                    continue;
+                }
+
+                aggregated
+                    .entry(server_match.file_path.clone())
+                    .or_insert_with(Vec::new)
+                    .extend(diagnostics);
+            }
+        }
+
+        aggregated
+    }
+
+    pub async fn status_for_file(&self, file_path: &Path, base_dir: &Path) -> Vec<LspStatus> {
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        let mut statuses = Vec::new();
+
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            self.reconcile_client_health(&key).await;
+            let health = self.client_health(&key).await.unwrap_or_default();
+            let retry_after_seconds = health.retry_at.and_then(|retry_at| {
+                retry_at
+                    .checked_duration_since(Instant::now())
+                    .map(|duration| duration.as_secs())
+            });
+            statuses.push(LspStatus {
+                server: server_match.server.id.clone(),
+                workspace_root: server_match.workspace_root,
+                state: health.state,
+                retry_after_seconds,
+                last_error: health.last_error,
+            });
+        }
+
+        statuses
+    }
+
+    pub async fn definition(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_position_operation(
+            "go_to_definition",
+            request,
+            base_dir,
+            |client, req| async move {
+                client
+                    .send_request(
+                        "textDocument/definition",
+                        json!({
+                            "textDocument": {
+                                "uri": path_to_uri(&req.file_path)?,
+                            },
+                            "position": to_lsp_position(req.line, req.character),
+                        }),
+                    )
+                    .await
+            },
+        )
+        .await
+        .map(|results| {
+            results
+                .into_iter()
+                .map(|result| LspOperationResult {
+                    server: result.server,
+                    workspace_root: result.workspace_root,
+                    operation: "go_to_definition".to_string(),
+                    items: normalize_location_like(&result.payload),
+                })
+                .collect()
+        })
+    }
+
+    pub async fn references(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_position_operation(
+            "find_references",
+            request,
+            base_dir,
+            |client, req| async move {
+                client
+                    .send_request(
+                        "textDocument/references",
+                        json!({
+                            "textDocument": {
+                                "uri": path_to_uri(&req.file_path)?,
+                            },
+                            "position": to_lsp_position(req.line, req.character),
+                            "context": {
+                                "includeDeclaration": true,
+                            },
+                        }),
+                    )
+                    .await
+            },
+        )
+        .await
+        .map(|results| {
+            results
+                .into_iter()
+                .map(|result| LspOperationResult {
+                    server: result.server,
+                    workspace_root: result.workspace_root,
+                    operation: "find_references".to_string(),
+                    items: normalize_location_like(&result.payload),
+                })
+                .collect()
+        })
+    }
+
+    pub async fn hover(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_position_operation("hover", request, base_dir, |client, req| async move {
+            client
+                .send_request(
+                    "textDocument/hover",
+                    json!({
+                        "textDocument": {
+                            "uri": path_to_uri(&req.file_path)?,
+                        },
+                        "position": to_lsp_position(req.line, req.character),
+                    }),
+                )
+                .await
+        })
+        .await
+        .map(|results| {
+            results
+                .into_iter()
+                .map(|result| LspOperationResult {
+                    server: result.server,
+                    workspace_root: result.workspace_root,
+                    operation: "hover".to_string(),
+                    items: normalize_hover(&result.payload).into_iter().collect(),
+                })
+                .collect()
+        })
+    }
+
+    pub async fn implementation(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_position_operation(
+            "go_to_implementation",
+            request,
+            base_dir,
+            |client, req| async move {
+                client
+                    .send_request(
+                        "textDocument/implementation",
+                        json!({
+                            "textDocument": {
+                                "uri": path_to_uri(&req.file_path)?,
+                            },
+                            "position": to_lsp_position(req.line, req.character),
+                        }),
+                    )
+                    .await
+            },
+        )
+        .await
+        .map(|results| {
+            results
+                .into_iter()
+                .map(|result| LspOperationResult {
+                    server: result.server,
+                    workspace_root: result.workspace_root,
+                    operation: "go_to_implementation".to_string(),
+                    items: normalize_location_like(&result.payload),
+                })
+                .collect()
+        })
+    }
+
+    pub async fn document_symbol(
+        &self,
+        file_path: &Path,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        if matches.is_empty() {
+            return Err(anyhow!("No LSP server available for this file type."));
+        }
+
+        let mut results = Vec::new();
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for document_symbol: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP server {} in {} failed to open {} for document_symbol: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display()
+                );
+                self.mark_client_broken(key, err.to_string()).await;
+                continue;
+            }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            let payload = match client
+                .send_request(
+                    "textDocument/documentSymbol",
+                    json!({
+                        "textDocument": {
+                            "uri": path_to_uri(&server_match.file_path)?,
+                        },
+                    }),
+                )
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request textDocument/documentSymbol failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    self.mark_client_broken(key, err.to_string()).await;
+                    continue;
+                }
+            };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            results.push(LspOperationResult {
+                server: server_match.server.id.clone(),
+                workspace_root: server_match.workspace_root,
+                operation: "document_symbol".to_string(),
+                items: normalize_document_symbols(&payload),
+            });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No LSP server was able to process document_symbol for this file."
+            ));
+        }
+
+        Ok(results)
+    }
+
+    pub async fn workspace_symbol(
+        &self,
+        query: &str,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        let matches = self.active_workspace_matches(base_dir).await;
+        if matches.is_empty() {
+            return Err(anyhow!(
+                "No active LSP client available for this workspace. Read or query a file first, or provide file_path to scope workspace_symbol."
+            ));
+        }
+
+        self.workspace_symbol_for_matches(query, matches).await
+    }
+
+    pub async fn workspace_symbol_for_file(
+        &self,
+        query: &str,
+        file_path: &Path,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        if matches.is_empty() {
+            return Err(anyhow!("No LSP server available for this file type."));
+        }
+
+        self.workspace_symbol_for_matches(query, matches).await
+    }
+
+    async fn workspace_symbol_for_matches(
+        &self,
+        query: &str,
+        matches: Vec<ServerMatch>,
+    ) -> Result<Vec<LspOperationResult>> {
+        let mut results = Vec::new();
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for workspace_symbol: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    continue;
+                }
+            };
+
+            let payload = match client
+                .send_request(
+                    "workspace/symbol",
+                    json!({
+                        "query": query,
+                    }),
+                )
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request workspace/symbol failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display()
+                    );
+                    self.mark_client_broken(key, err.to_string()).await;
+                    continue;
+                }
+            };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            results.push(LspOperationResult {
+                server: server_match.server.id.clone(),
+                workspace_root: server_match.workspace_root,
+                operation: "workspace_symbol".to_string(),
+                items: normalize_symbol_information(&payload),
+            });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No LSP server was able to process workspace_symbol for this workspace."
+            ));
+        }
+
+        Ok(results)
+    }
+
+    pub async fn prepare_call_hierarchy(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_position_operation(
+            "prepare_call_hierarchy",
+            request,
+            base_dir,
+            |client, req| async move {
+                client
+                    .send_request(
+                        "textDocument/prepareCallHierarchy",
+                        json!({
+                            "textDocument": {
+                                "uri": path_to_uri(&req.file_path)?,
+                            },
+                            "position": to_lsp_position(req.line, req.character),
+                        }),
+                    )
+                    .await
+            },
+        )
+        .await
+        .map(|results| {
+            results
+                .into_iter()
+                .map(|result| LspOperationResult {
+                    server: result.server,
+                    workspace_root: result.workspace_root,
+                    operation: "prepare_call_hierarchy".to_string(),
+                    items: normalize_call_hierarchy_items(&result.payload),
+                })
+                .collect()
+        })
+    }
+
+    pub async fn incoming_calls(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_call_hierarchy_follow_up(
+            "incoming_calls",
+            request,
+            base_dir,
+            "callHierarchy/incomingCalls",
+        )
+        .await
+    }
+
+    pub async fn outgoing_calls(
+        &self,
+        request: PositionRequest,
+        base_dir: &Path,
+    ) -> Result<Vec<LspOperationResult>> {
+        self.run_call_hierarchy_follow_up(
+            "outgoing_calls",
+            request,
+            base_dir,
+            "callHierarchy/outgoingCalls",
+        )
+        .await
+    }
+
+    async fn run_call_hierarchy_follow_up(
+        &self,
+        operation: &str,
+        request: PositionRequest,
+        base_dir: &Path,
+        method: &str,
+    ) -> Result<Vec<LspOperationResult>> {
+        let matches = self
+            .matching_server_matches(&request.file_path, base_dir)
+            .await;
+        if matches.is_empty() {
+            return Err(anyhow!("No LSP server available for this file type."));
+        }
+
+        let mut results = Vec::new();
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                        operation
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP server {} in {} failed to open {} for {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display(),
+                    operation
+                );
+                self.mark_client_broken(key.clone(), err.to_string()).await;
+                continue;
+            }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            let prepared = match client
+                .send_request(
+                    "textDocument/prepareCallHierarchy",
+                    json!({
+                    "textDocument": {
+                        "uri": path_to_uri(&server_match.file_path)?,
+                    },
+                        "position": to_lsp_position(request.line, request.character),
+                    }),
+                )
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP prepareCallHierarchy request failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                    );
+                    self.mark_client_broken(key.clone(), err.to_string()).await;
+                    continue;
+                }
+            };
+
+            let Some(first_item) = prepared.as_array().and_then(|items| items.first()).cloned()
+            else {
+                results.push(LspOperationResult {
+                    server: server_match.server.id.clone(),
+                    workspace_root: server_match.workspace_root,
+                    operation: operation.to_string(),
+                    items: Vec::new(),
+                });
+                continue;
+            };
+
+            let payload = match client
+                .send_request(
+                    method,
+                    json!({
+                        "item": first_item,
+                    }),
+                )
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request {method} failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                    );
+                    self.mark_client_broken(key, err.to_string()).await;
+                    continue;
+                }
+            };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            results.push(LspOperationResult {
+                server: server_match.server.id.clone(),
+                workspace_root: server_match.workspace_root,
+                operation: operation.to_string(),
+                items: normalize_call_hierarchy_calls(&payload),
+            });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No LSP server was able to process this call hierarchy operation."
+            ));
+        }
+
+        Ok(results)
+    }
+
+    async fn run_position_operation<F, Fut>(
+        &self,
+        operation_name: &str,
+        request: PositionRequest,
+        base_dir: &Path,
+        operation: F,
+    ) -> Result<Vec<RawOperationResult>>
+    where
+        F: Fn(Arc<ClientHandle>, PositionRequest) -> Fut + Copy,
+        Fut: std::future::Future<Output = Result<Value>>,
+    {
+        let matches = self
+            .matching_server_matches(&request.file_path, base_dir)
+            .await;
+        if matches.is_empty() {
+            return Err(anyhow!("No LSP server available for this file type."));
+        }
+
+        let mut results = Vec::new();
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let client = match self.client_for_match(&server_match).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        "LSP server {} in {} could not be reused for {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                        operation_name
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+                warn!(
+                    "LSP server {} in {} failed to open {} for {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display(),
+                    operation_name
+                );
+                self.mark_client_broken(key.clone(), err.to_string()).await;
+                continue;
+            }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            let payload = match operation(
+                client,
+                PositionRequest {
+                    file_path: server_match.file_path.clone(),
+                    line: request.line,
+                    character: request.character,
+                },
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        "LSP request for {operation_name} failed for {} in {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                    );
+                    self.mark_client_broken(key, err.to_string()).await;
+                    continue;
+                }
+            };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+            results.push(RawOperationResult {
+                server: server_match.server.id.clone(),
+                workspace_root: server_match.workspace_root,
+                payload,
+            });
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!("No LSP server was able to process this operation."));
+        }
+
+        Ok(results)
+    }
+
+    pub(crate) async fn client_for_match(
+        &self,
+        server_match: &ServerMatch,
+    ) -> Result<Arc<ClientHandle>> {
+        let key = self.client_key(server_match);
+        self.reconcile_client_health(&key).await;
+        if let Some(retry_after_seconds) = self.retry_after_seconds(&key).await {
+            return Err(anyhow!(
+                "LSP server {} is temporarily unavailable for {}. Retry later in {}s.",
+                key.server_id,
+                key.workspace_root.display(),
+                retry_after_seconds,
+            ));
+        }
+
+        if let Some(existing) = self.clients.read().await.get(&key).cloned() {
+            return Ok(existing);
+        }
+
+        let client_lock = self.client_lock(&key).await;
+        let _guard = client_lock.lock().await;
+
+        self.reconcile_client_health(&key).await;
+        if let Some(retry_after_seconds) = self.retry_after_seconds(&key).await {
+            return Err(anyhow!(
+                "LSP server {} is temporarily unavailable for {}. Retry later in {}s.",
+                key.server_id,
+                key.workspace_root.display(),
+                retry_after_seconds,
+            ));
+        }
+
+        if let Some(existing) = self.clients.read().await.get(&key).cloned() {
+            return Ok(existing);
+        }
+
+        self.mark_client_starting(&server_match.server.id, &server_match.workspace_root)
+            .await;
+
+        let client = match ClientHandle::spawn(
+            server_match.server.clone(),
+            key.workspace_root.clone(),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(err) => {
+                warn!(
+                    "failed to start LSP server {} in {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display()
+                );
+                self.mark_client_broken(key.clone(), err.to_string()).await;
+                return Err(err);
+            }
+        };
+
+        self.clients
+            .write()
+            .await
+            .insert(key.clone(), client.clone());
+        self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+            .await;
+        Ok(client)
+    }
+
+    pub(crate) fn client_key(&self, server_match: &ServerMatch) -> ClientKey {
+        ClientKey {
+            server_id: server_match.server.id.clone(),
+            workspace_root: server_match.workspace_root.clone(),
+        }
+    }
+
+    async fn retry_after_seconds(&self, key: &ClientKey) -> Option<u64> {
+        let health = self.client_health(key).await?;
+        let retry_at = health.retry_at?;
+        retry_at
+            .checked_duration_since(Instant::now())
+            .map(|duration| duration.as_secs())
+    }
+
+    async fn client_health(&self, key: &ClientKey) -> Option<ClientHealth> {
+        self.client_health.read().await.get(key).cloned()
+    }
+
+    async fn client_lock(&self, key: &ClientKey) -> Arc<Mutex<()>> {
+        let mut locks = self.client_locks.lock().await;
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn reconcile_client_health(&self, key: &ClientKey) {
+        let Some(client) = self.clients.read().await.get(key).cloned() else {
+            return;
+        };
+        if client.is_running() {
+            return;
+        }
+
+        self.mark_client_broken(key.clone(), "LSP connection closed".to_string())
+            .await;
+    }
+
+    async fn mark_client_starting(&self, server_id: &str, workspace_root: &Path) {
+        let key = ClientKey {
+            server_id: server_id.to_string(),
+            workspace_root: workspace_root.to_path_buf(),
+        };
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.state = LspClientState::Starting;
+        entry.retry_at = None;
+    }
+
+    async fn mark_client_success(&self, server_id: &str, workspace_root: &Path) {
+        let key = ClientKey {
+            server_id: server_id.to_string(),
+            workspace_root: workspace_root.to_path_buf(),
+        };
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.state = LspClientState::Connected;
+        entry.failure_count = 0;
+        entry.retry_at = None;
+        entry.last_error = None;
+        entry.last_success_at = Some(SystemTime::now());
+    }
+
+    pub(crate) async fn mark_client_broken(&self, key: ClientKey, error: String) {
+        if let Some(client) = self.clients.write().await.remove(&key) {
+            drop(client);
+        }
+
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.failure_count = entry.failure_count.saturating_add(1);
+        entry.state = LspClientState::Broken;
+        entry.last_error = Some(error);
+        entry.retry_at = Some(Instant::now() + backoff_for_failure(entry.failure_count));
+    }
+
+    pub(crate) async fn matching_server_matches(
+        &self,
+        file_path: &Path,
+        base_dir: &Path,
+    ) -> Vec<ServerMatch> {
+        let Some(config) = self.config.as_ref() else {
+            return Vec::new();
+        };
+        let file_path = resolve_absolute_path(base_dir, file_path);
+        let extension = file_path
+            .extension()
+            .map(|ext| format!(".{}", ext.to_string_lossy()))
+            .unwrap_or_default();
+
+        let mut matches = Vec::new();
+        for server in &config.servers {
+            if !server
+                .extensions
+                .iter()
+                .any(|candidate| candidate == &extension)
+            {
+                continue;
+            }
+            if resolve_command(&server.command).is_err() {
+                continue;
+            }
+
+            matches.push(ServerMatch {
+                file_path: file_path.clone(),
+                workspace_root: resolve_workspace_root(&file_path, &server.root_markers, base_dir),
+                server: server.clone(),
+            });
+        }
+
+        matches.sort_by(|a, b| a.server.id.cmp(&b.server.id));
+        matches
+    }
+
+    async fn active_workspace_matches(&self, base_dir: &Path) -> Vec<ServerMatch> {
+        let Some(config) = self.config.as_ref() else {
+            return Vec::new();
+        };
+
+        let active_keys = self
+            .clients
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for key in active_keys {
+            if !workspace_roots_overlap(&key.workspace_root, base_dir) {
+                continue;
+            }
+            self.reconcile_client_health(&key).await;
+            let Some(server) = config
+                .servers
+                .iter()
+                .find(|server| server.id == key.server_id)
+            else {
+                continue;
+            };
+
+            matches.push(ServerMatch {
+                file_path: base_dir.to_path_buf(),
+                workspace_root: key.workspace_root,
+                server: server.clone(),
+            });
+        }
+
+        matches.sort_by(|a, b| a.server.id.cmp(&b.server.id));
+        matches
+    }
+}
+
+impl Drop for SessionManager {
+    fn drop(&mut self) {
+        let clients = Arc::clone(&self.clients);
+        let client_health = Arc::clone(&self.client_health);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let drained = clients
+                    .write()
+                    .await
+                    .drain()
+                    .collect::<Vec<(ClientKey, Arc<ClientHandle>)>>();
+                for (key, client) in drained {
+                    let mut health = client_health.write().await;
+                    let entry = health.entry(key).or_default();
+                    entry.state = LspClientState::Closed;
+                    entry.retry_at = None;
+                    entry.last_error = None;
+                    drop(health);
+                    client.shutdown().await;
+                }
+            });
+            return;
+        }
+
+        let drained = self
+            .clients
+            .try_write()
+            .ok()
+            .map(|mut clients| {
+                clients
+                    .drain()
+                    .map(|(_, client)| client)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for client in drained {
+            if let Some(child) = client.child.as_ref()
+                && let Ok(mut child) = child.try_lock()
+            {
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ServerMatch {
+    pub(crate) file_path: PathBuf,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) server: ServerConfig,
+}
+
+#[derive(Debug)]
+struct RawOperationResult {
+    server: String,
+    workspace_root: PathBuf,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ClientKey {
+    pub(crate) server_id: String,
+    pub(crate) workspace_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClientHealth {
+    pub(crate) state: LspClientState,
+    pub(crate) failure_count: u32,
+    pub(crate) retry_at: Option<Instant>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) last_success_at: Option<SystemTime>,
+}
+
+impl Default for ClientHealth {
+    fn default() -> Self {
+        Self {
+            state: LspClientState::Closed,
+            failure_count: 0,
+            retry_at: None,
+            last_error: None,
+            last_success_at: None,
+        }
+    }
+}
