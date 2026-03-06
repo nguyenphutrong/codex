@@ -736,6 +736,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn did_save_only_sends_for_open_documents() -> Result<()> {
+        let tmp = tempdir()?;
+        let file_path = tmp.path().join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+        let (mut server_reader, mut server_writer) = tokio::io::split(server_stream);
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let methods_for_server = methods.clone();
+        let client = ClientHandle::from_streams(
+            "fake".to_string(),
+            tmp.path().to_path_buf(),
+            None,
+            client_writer,
+            client_reader,
+            None,
+        )
+        .await?;
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut server_reader);
+            let request = read_lsp_message(&mut reader)
+                .await
+                .expect("initialize")
+                .expect("initialize request");
+            let id = request.get("id").cloned().expect("request id");
+            write_lsp_message(
+                &mut server_writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": {
+                                "save": true,
+                            },
+                        },
+                    },
+                }),
+            )
+            .await
+            .expect("write initialize response");
+            let _ = read_lsp_message(&mut reader).await.expect("initialized");
+
+            while let Ok(Some(message)) = read_lsp_message(&mut reader).await {
+                let Some(method) = message.get("method").and_then(Value::as_str) else {
+                    continue;
+                };
+                methods_for_server.lock().await.push(method.to_string());
+            }
+        });
+
+        client.initialize().await?;
+        client.did_save(&file_path).await?;
+        client.open_or_change(&file_path).await?;
+        client.did_save(&file_path).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let methods = methods.lock().await.clone();
+        let did_save_count = methods
+            .iter()
+            .filter(|method| method.as_str() == "textDocument/didSave")
+            .count();
+        assert_eq!(did_save_count, 1);
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == "textDocument/didOpen")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn server_crash_restarts_and_reopens_tracked_documents() -> Result<()> {
         let tmp = tempdir()?;
         let file_path = tmp.path().join("main.rs");

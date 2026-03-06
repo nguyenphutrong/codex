@@ -297,10 +297,6 @@ impl ClientHandle {
                 )
                 .await?;
             }
-            if sync_capabilities.save.supported {
-                self.send_did_save(file_path, &text, sync_capabilities.save.include_text)
-                    .await?;
-            }
             return Ok(touch_revision);
         }
 
@@ -329,11 +325,35 @@ impl ClientHandle {
             )
             .await?;
         }
-        if sync_capabilities.save.supported {
-            self.send_did_save(file_path, &text, sync_capabilities.save.include_text)
-                .await?;
-        }
         Ok(touch_revision)
+    }
+
+    pub(crate) async fn did_save(&self, file_path: &Path) -> Result<()> {
+        if !self
+            .state
+            .opened_versions
+            .lock()
+            .await
+            .contains_key(file_path)
+        {
+            return Ok(());
+        }
+
+        let save_capabilities = self.state.sync_capabilities.read().await.save;
+        if !save_capabilities.supported {
+            return Ok(());
+        }
+
+        let text = if save_capabilities.include_text {
+            Some(
+                fs::read_to_string(file_path)
+                    .await
+                    .with_context(|| format!("failed to read {}", file_path.display()))?,
+            )
+        } else {
+            None
+        };
+        self.send_did_save(file_path, text.as_deref()).await
     }
 
     pub(crate) async fn diagnostics_for_path(&self, file_path: &Path) -> Vec<LspDiagnostic> {
@@ -436,13 +456,13 @@ impl ClientHandle {
         Ok(())
     }
 
-    async fn send_did_save(&self, file_path: &Path, text: &str, include_text: bool) -> Result<()> {
+    async fn send_did_save(&self, file_path: &Path, text: Option<&str>) -> Result<()> {
         let mut params = json!({
             "textDocument": {
                 "uri": path_to_uri(file_path)?,
             },
         });
-        if include_text {
+        if let Some(text) = text {
             params["text"] = Value::String(text.to_string());
         }
         self.send_notification("textDocument/didSave", params).await
