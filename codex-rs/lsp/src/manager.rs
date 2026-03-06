@@ -35,6 +35,7 @@ use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
+use tracing::info;
 use tracing::warn;
 
 type SpawnClientFuture = Pin<Box<dyn Future<Output = Result<Arc<ClientHandle>>> + Send + 'static>>;
@@ -960,6 +961,11 @@ impl SessionManager {
             return;
         }
 
+        warn!(
+            server_id = %key.server_id,
+            workspace_root = %key.workspace_root.display(),
+            "LSP crash detected"
+        );
         self.mark_client_broken_and_restart(key.clone(), "LSP connection closed".to_string())
             .await;
     }
@@ -1034,7 +1040,7 @@ impl SessionManager {
             let mut health = self.client_health.write().await;
             let entry = health.entry(key.clone()).or_default();
             entry.state = LspClientState::Broken;
-            entry.last_error = Some(error);
+            entry.last_error = Some(error.clone());
             entry.retry_at = None;
             entry.tracked_documents = tracked_documents;
             if !entry.permanent_broken && !entry.restart_in_progress {
@@ -1044,6 +1050,12 @@ impl SessionManager {
         }
 
         if should_restart {
+            warn!(
+                server_id = %key.server_id,
+                workspace_root = %key.workspace_root.display(),
+                error = %error,
+                "LSP client marked broken"
+            );
             let manager = self.clone();
             tokio::spawn(async move {
                 manager.restart_client(key).await;
@@ -1091,6 +1103,13 @@ impl SessionManager {
         let mut last_error = None;
 
         for (attempt, delay) in self.restart_backoff.iter().copied().enumerate() {
+            info!(
+                server_id = %key.server_id,
+                workspace_root = %key.workspace_root.display(),
+                attempt = attempt + 1,
+                backoff_ms = delay.as_millis() as u64,
+                "LSP restart attempt scheduled"
+            );
             {
                 let mut health = self.client_health.write().await;
                 let entry = health.entry(key.clone()).or_default();
@@ -1130,10 +1149,10 @@ impl SessionManager {
         }
 
         warn!(
-            "LSP server {} in {} is permanently broken after {} restart attempts",
-            key.server_id,
-            key.workspace_root.display(),
-            self.restart_backoff.len()
+            server_id = %key.server_id,
+            workspace_root = %key.workspace_root.display(),
+            attempts = self.restart_backoff.len(),
+            "LSP server is permanently broken after restart attempts"
         );
 
         let mut health = self.client_health.write().await;
