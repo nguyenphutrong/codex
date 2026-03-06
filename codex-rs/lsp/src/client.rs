@@ -20,6 +20,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -34,6 +35,9 @@ use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::timeout;
 use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 use crate::types::ServerConfig;
 
@@ -90,8 +94,15 @@ pub(crate) struct CachedDiagnostics {
 }
 
 #[derive(Debug)]
+pub(crate) struct PendingRequest {
+    pub(crate) method: String,
+    pub(crate) started_at: Instant,
+    pub(crate) sender: oneshot::Sender<Result<Value>>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ClientState {
-    pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    pub(crate) pending: Mutex<HashMap<u64, PendingRequest>>,
     pub(crate) diagnostics: RwLock<HashMap<PathBuf, CachedDiagnostics>>,
     pub(crate) opened_versions: Mutex<HashMap<PathBuf, i32>>,
     pub(crate) sync_capabilities: RwLock<TextDocumentSyncCapabilities>,
@@ -103,6 +114,7 @@ pub(crate) struct ClientState {
 
 #[derive(Debug)]
 pub(crate) struct ClientHandle {
+    pub(crate) server_id: String,
     pub(crate) workspace_root: PathBuf,
     pub(crate) initialization: Option<Value>,
     pub(crate) writer_tx: mpsc::UnboundedSender<Value>,
@@ -112,6 +124,11 @@ pub(crate) struct ClientHandle {
 
 impl ClientHandle {
     pub(crate) async fn spawn(server: ServerConfig, workspace_root: PathBuf) -> Result<Arc<Self>> {
+        info!(
+            server_id = %server.id,
+            workspace_root = %workspace_root.display(),
+            "LSP server spawn"
+        );
         let command_path = resolve_command(&server.command)?;
         let mut command = Command::new(command_path);
         command
@@ -135,8 +152,9 @@ impl ClientHandle {
             .take()
             .ok_or_else(|| anyhow!("LSP process did not expose stdout"))?;
 
+        let initialize_started_at = Instant::now();
         let client = Self::from_streams(
-            server.id,
+            server.id.clone(),
             workspace_root,
             server.initialization,
             stdin,
@@ -144,12 +162,25 @@ impl ClientHandle {
             Some(child),
         )
         .await?;
-        client.initialize().await?;
+        if let Err(err) = client.initialize().await {
+            error!(
+                server_id = %server.id,
+                duration_ms = initialize_started_at.elapsed().as_millis() as u64,
+                error = %err,
+                "LSP initialize failed"
+            );
+            return Err(err);
+        }
+        info!(
+            server_id = %server.id,
+            duration_ms = initialize_started_at.elapsed().as_millis() as u64,
+            "LSP initialize succeeded"
+        );
         Ok(client)
     }
 
     pub(crate) async fn from_streams<W, R>(
-        _server_id: String,
+        server_id: String,
         workspace_root: PathBuf,
         initialization: Option<Value>,
         writer: W,
@@ -183,6 +214,7 @@ impl ClientHandle {
         });
 
         let client = Arc::new(Self {
+            server_id,
             workspace_root,
             initialization,
             writer_tx,
@@ -312,6 +344,12 @@ impl ClientHandle {
                 )
                 .await?;
             }
+            info!(
+                server_id = %self.server_id,
+                file_path = %file_path.display(),
+                version = *version,
+                "LSP document changed"
+            );
             return Ok(touch_revision);
         }
 
@@ -340,6 +378,12 @@ impl ClientHandle {
             )
             .await?;
         }
+        info!(
+            server_id = %self.server_id,
+            file_path = %file_path.display(),
+            version = 0,
+            "LSP document opened"
+        );
         Ok(touch_revision)
     }
 
@@ -368,7 +412,13 @@ impl ClientHandle {
         } else {
             None
         };
-        self.send_did_save(file_path, text.as_deref()).await
+        self.send_did_save(file_path, text.as_deref()).await?;
+        info!(
+            server_id = %self.server_id,
+            file_path = %file_path.display(),
+            "LSP document saved"
+        );
+        Ok(())
     }
 
     pub(crate) async fn ensure_definition_support(&self) -> Result<()> {
@@ -464,7 +514,20 @@ impl ClientHandle {
     pub(crate) async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         let request_id = self.state.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
-        self.state.pending.lock().await.insert(request_id, tx);
+        self.state.pending.lock().await.insert(
+            request_id,
+            PendingRequest {
+                method: method.to_string(),
+                started_at: Instant::now(),
+                sender: tx,
+            },
+        );
+        info!(
+            server_id = %self.server_id,
+            request_id,
+            method,
+            "LSP request sent"
+        );
 
         self.writer_tx
             .send(json!({
@@ -575,6 +638,12 @@ impl ClientHandle {
             .flatten()
             .filter_map(|diagnostic| diagnostic_from_value(&path, diagnostic))
             .collect::<Vec<_>>();
+        info!(
+            server_id = %self.server_id,
+            file_path = %path.display(),
+            diagnostic_count = diagnostics.len(),
+            "LSP diagnostics received"
+        );
 
         let revision = self.next_state_revision();
         let mut cached = self.state.diagnostics.write().await;
@@ -601,19 +670,36 @@ impl ClientHandle {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown LSP error");
+            warn!(
+                server_id = %self.server_id,
+                request_id = id,
+                method = %pending.method,
+                duration_ms = pending.started_at.elapsed().as_millis() as u64,
+                error = error_message,
+                "LSP response received with error"
+            );
             Err(anyhow!("LSP request failed: {error_message}"))
         } else {
+            info!(
+                server_id = %self.server_id,
+                request_id = id,
+                method = %pending.method,
+                duration_ms = pending.started_at.elapsed().as_millis() as u64,
+                "LSP response received"
+            );
             Ok(message.get("result").cloned().unwrap_or(Value::Null))
         };
 
-        let _ = pending.send(result);
+        let _ = pending.sender.send(result);
         Ok(())
     }
 
     pub(crate) async fn fail_pending(&self, message: &str) {
         let mut pending = self.state.pending.lock().await;
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(anyhow!(message.to_string())));
+        for (_, pending_request) in pending.drain() {
+            let _ = pending_request
+                .sender
+                .send(Err(anyhow!(message.to_string())));
         }
     }
 
