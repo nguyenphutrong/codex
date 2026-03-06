@@ -377,6 +377,9 @@
             "js_repl_tools_only": {
               "type": "boolean"
             },
+            "lsp": {
+              "type": "boolean"
+            },
             "memories": {
               "type": "boolean"
             },
@@ -633,6 +636,59 @@
           "type": "string"
         }
       ]
+    },
+    "LspServerToml": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "extensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "initialization": true,
+        "root_markers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "LspToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "servers": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LspServerToml"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "MemoriesToml": {
       "additionalProperties": false,
@@ -1768,6 +1824,9 @@
         "js_repl_tools_only": {
           "type": "boolean"
         },
+        "lsp": {
+          "type": "boolean"
+        },
         "memories": {
           "type": "boolean"
         },
@@ -1936,6 +1995,14 @@
         }
       ],
       "description": "Directory where Codex writes log files, for example `codex-tui.log`. Defaults to `$CODEX_HOME/log`."
+    },
+    "lsp": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LspToml"
+        }
+      ],
+      "description": "LSP runtime settings used for built-in code intelligence features."
     },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",

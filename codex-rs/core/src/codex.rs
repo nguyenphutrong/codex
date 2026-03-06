@@ -291,6 +291,9 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::util::backoff;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_async_utils::OrCancelExt;
+use codex_lsp::LspConfig as RuntimeLspConfig;
+use codex_lsp::ServerConfig as RuntimeLspServerConfig;
+use codex_lsp::SessionManager as LspSessionManager;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
@@ -740,6 +743,7 @@ impl TurnContext {
             session_source: self.session_source.clone(),
         })
         .with_allow_login_shell(self.tools_config.allow_login_shell)
+        .with_lsp_enabled(config.lsp.is_some())
         .with_agent_roles(config.agent_roles.clone());
 
         Self {
@@ -1115,6 +1119,7 @@ impl Session {
             session_source: session_source.clone(),
         })
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
+        .with_lsp_enabled(per_turn_config.lsp.is_some())
         .with_agent_roles(per_turn_config.agent_roles.clone());
 
         let cwd = session_configuration.cwd.clone();
@@ -1496,6 +1501,23 @@ impl Session {
             } else {
                 (None, None)
             };
+        let lsp_manager = config.lsp.as_ref().map(|lsp| {
+            Arc::new(LspSessionManager::new(Some(RuntimeLspConfig {
+                servers: lsp
+                    .servers
+                    .iter()
+                    .map(|server| RuntimeLspServerConfig {
+                        id: server.id.clone(),
+                        command: server.command.clone(),
+                        args: server.args.clone(),
+                        extensions: server.extensions.clone(),
+                        env: server.env.clone(),
+                        initialization: server.initialization.clone(),
+                        root_markers: server.root_markers.clone(),
+                    })
+                    .collect(),
+            })))
+        });
 
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
@@ -1539,6 +1561,7 @@ impl Session {
             network_proxy,
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
+            lsp_manager,
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
@@ -4802,6 +4825,7 @@ async fn spawn_review_thread(
         session_source: parent_turn_context.session_source.clone(),
     })
     .with_allow_login_shell(config.permissions.allow_login_shell)
+    .with_lsp_enabled(config.lsp.is_some())
     .with_agent_roles(config.agent_roles.clone());
 
     let review_prompt = resolved.prompt.clone();
@@ -8837,6 +8861,7 @@ mod tests {
             network_proxy: None,
             network_approval: Arc::clone(&network_approval),
             state_db: None,
+            lsp_manager: None,
             model_client: ModelClient::new(
                 Some(auth_manager.clone()),
                 conversation_id,
@@ -9246,6 +9271,7 @@ mod tests {
             network_proxy: None,
             network_approval: Arc::clone(&network_approval),
             state_db: None,
+            lsp_manager: None,
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,

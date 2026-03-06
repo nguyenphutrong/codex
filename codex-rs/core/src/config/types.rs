@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as SerdeError;
+use serde_json::Value as JsonValue;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 16;
@@ -555,6 +556,42 @@ pub struct AppsConfigToml {
     /// Per-app settings keyed by app ID (for example `[apps.google_drive]`).
     #[serde(default, flatten)]
     pub apps: HashMap<String, AppConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LspToml {
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub servers: HashMap<String, LspServerToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LspServerToml {
+    pub disabled: Option<bool>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub extensions: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub initialization: Option<JsonValue>,
+    pub root_markers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspConfig {
+    pub servers: Vec<LspServerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub extensions: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization: Option<JsonValue>,
+    pub root_markers: Vec<String>,
 }
 
 // ===== OTEL configuration =====

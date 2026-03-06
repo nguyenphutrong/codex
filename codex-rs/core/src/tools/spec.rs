@@ -72,6 +72,7 @@ pub(crate) struct ToolsConfig {
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
+    pub lsp_enabled: bool,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -172,6 +173,7 @@ impl ToolsConfig {
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
+            lsp_enabled: false,
         }
     }
 
@@ -182,6 +184,11 @@ impl ToolsConfig {
 
     pub fn with_allow_login_shell(mut self, allow_login_shell: bool) -> Self {
         self.allow_login_shell = allow_login_shell;
+        self
+    }
+
+    pub fn with_lsp_enabled(mut self, lsp_enabled: bool) -> Self {
+        self.lsp_enabled = lsp_enabled;
         self
     }
 }
@@ -1421,6 +1428,67 @@ fn create_list_dir_tool() -> ToolSpec {
     })
 }
 
+fn create_lsp_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "operation".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "The LSP operation to perform: go_to_definition, find_references, hover, \
+                     document_symbol, workspace_symbol, go_to_implementation, \
+                     prepare_call_hierarchy, incoming_calls, or outgoing_calls."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "file_path".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Path to the target file. May be absolute or relative to the current working directory."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "line".to_string(),
+            JsonSchema::Number {
+                description: Some("1-indexed line number for position-based operations.".to_string()),
+            },
+        ),
+        (
+            "character".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "1-indexed character number for position-based operations.".to_string(),
+                ),
+            },
+        ),
+        (
+            "query".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Search query for workspace_symbol. Ignored by the other operations."
+                        .to_string(),
+                ),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "lsp".to_string(),
+        description:
+            "Queries configured Language Server Protocol servers for definitions, references, hover text, symbols, and call hierarchy."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["operation".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_js_repl_tool() -> ToolSpec {
     // Keep JS input freeform, but block the most common malformed payload shapes
     // (JSON wrappers, quoted strings, and markdown fences) before they reach the
@@ -1806,6 +1874,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::JsReplHandler;
     use crate::tools::handlers::JsReplResetHandler;
     use crate::tools::handlers::ListDirHandler;
+    use crate::tools::handlers::LspHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::MultiAgentHandler;
@@ -1949,6 +2018,12 @@ pub(crate) fn build_specs(
         let list_dir_handler = Arc::new(ListDirHandler);
         builder.push_spec_with_parallel_support(create_list_dir_tool(), true);
         builder.register_handler("list_dir", list_dir_handler);
+    }
+
+    if config.lsp_enabled {
+        let lsp_handler = Arc::new(LspHandler);
+        builder.push_spec(create_lsp_tool());
+        builder.register_handler("lsp", lsp_handler);
     }
 
     if config
@@ -3609,5 +3684,30 @@ Examples of valid command strings:
                 },
             })]
         );
+    }
+
+    #[test]
+    fn lsp_tool_is_hidden_by_default() {
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info_from_models_json("gpt-5-codex"),
+            features: &Features::with_defaults(),
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert_lacks_tool_name(&tools, "lsp");
+    }
+
+    #[test]
+    fn lsp_tool_is_registered_when_enabled() {
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info_from_models_json("gpt-5-codex"),
+            features: &Features::with_defaults(),
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        })
+        .with_lsp_enabled(true);
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert_contains_tool_names(&tools, &["lsp"]);
     }
 }

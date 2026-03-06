@@ -12,6 +12,47 @@ Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the c
 
 - https://developers.openai.com/codex/config-reference
 
+## LSP integration
+
+Codex includes an experimental built-in LSP integration for definitions, references, hover text, symbols, call hierarchy, and post-`apply_patch` diagnostics.
+
+Enable it with:
+
+```toml
+[features]
+lsp = true
+
+[lsp]
+enabled = true
+```
+
+Codex ships a small built-in server catalog for `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`, `clangd`, and `sourcekit-lsp`. A server is only activated when its command is available locally.
+
+You can override a built-in server or add a custom one:
+
+```toml
+[lsp.servers.rust]
+root_markers = ["Cargo.toml", "rust-project.json", ".git"]
+
+[lsp.servers.custom]
+command = "custom-lsp-server"
+args = ["--stdio"]
+extensions = [".custom"]
+root_markers = [".git"]
+```
+
+Each server entry supports:
+
+- `disabled`
+- `command`
+- `args`
+- `extensions`
+- `env`
+- `initialization`
+- `root_markers`
+
+When enabled, Codex exposes a built-in `lsp` tool and appends LSP `ERROR` diagnostics for touched files after successful `apply_patch` runs when a matching server is available.
+
 ## Apps (Connectors)
 
 Use `$` in the composer to insert a ChatGPT connector; the popover lists accessible

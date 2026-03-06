@@ -4,6 +4,8 @@ use crate::config::edit::ConfigEditsBuilder;
 use crate::config::types::AppsConfigToml;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
 use crate::config::types::History;
+use crate::config::types::LspConfig;
+use crate::config::types::LspToml;
 use crate::config::types::McpServerConfig;
 use crate::config::types::McpServerDisabledReason;
 use crate::config::types::McpServerTransportConfig;
@@ -93,6 +95,7 @@ use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
 pub mod edit;
+mod lsp;
 mod managed_features;
 mod network_proxy_spec;
 mod permissions;
@@ -464,6 +467,9 @@ pub struct Config {
     /// file edits as a structured tool call. When unset, this falls back to the
     /// model info's default preference.
     pub include_apply_patch_tool: bool,
+
+    /// Resolved LSP configuration for built-in code intelligence features.
+    pub lsp: Option<LspConfig>,
 
     /// Explicit or feature-derived web search mode.
     pub web_search_mode: Constrained<WebSearchMode>,
@@ -1222,6 +1228,9 @@ pub struct ConfigToml {
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
 
+    /// LSP runtime settings used for built-in code intelligence features.
+    pub lsp: Option<LspToml>,
+
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
 
@@ -1763,6 +1772,7 @@ impl Config {
 
         let configured_features = Features::from_config(&cfg, &config_profile, feature_overrides);
         let features = ManagedFeatures::from_configured(configured_features, feature_requirements)?;
+        let lsp = lsp::resolve_lsp_config(&cfg, &features)?;
         let windows_sandbox_mode = resolve_windows_sandbox_mode(&cfg, &config_profile);
         let resolved_cwd = {
             use std::env;
@@ -1873,7 +1883,6 @@ impl Config {
                 std::io::Error::new(std::io::ErrorKind::NotFound, message)
             })?
             .clone();
-
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
@@ -2239,6 +2248,7 @@ impl Config {
             forced_chatgpt_workspace_id,
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
+            lsp,
             web_search_mode: constrained_web_search_mode.value,
             use_experimental_unified_exec_tool,
             background_terminal_max_timeout,
@@ -5247,6 +5257,7 @@ model_verbosity = "high"
                 forced_chatgpt_workspace_id: None,
                 forced_login_method: None,
                 include_apply_patch_tool: false,
+                lsp: None,
                 web_search_mode: Constrained::allow_any(WebSearchMode::Cached),
                 use_experimental_unified_exec_tool: !cfg!(windows),
                 background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
@@ -5377,6 +5388,7 @@ model_verbosity = "high"
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
             include_apply_patch_tool: false,
+            lsp: None,
             web_search_mode: Constrained::allow_any(WebSearchMode::Cached),
             use_experimental_unified_exec_tool: !cfg!(windows),
             background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
@@ -5505,6 +5517,7 @@ model_verbosity = "high"
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
             include_apply_patch_tool: false,
+            lsp: None,
             web_search_mode: Constrained::allow_any(WebSearchMode::Cached),
             use_experimental_unified_exec_tool: !cfg!(windows),
             background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
@@ -5619,6 +5632,7 @@ model_verbosity = "high"
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
             include_apply_patch_tool: false,
+            lsp: None,
             web_search_mode: Constrained::allow_any(WebSearchMode::Cached),
             use_experimental_unified_exec_tool: !cfg!(windows),
             background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
