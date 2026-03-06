@@ -180,6 +180,35 @@ impl SessionManager {
         aggregated
     }
 
+    pub async fn did_save_file(&self, file_path: &Path, base_dir: &Path) -> Result<()> {
+        let matches = self.matching_server_matches(file_path, base_dir).await;
+        if matches.is_empty() {
+            return Ok(());
+        }
+
+        for server_match in matches {
+            let key = self.client_key(&server_match);
+            let Ok(client) = self.client_for_match(&server_match).await else {
+                continue;
+            };
+            if let Err(err) = client.did_save(&server_match.file_path).await {
+                warn!(
+                    "LSP client {} in {} failed to save {}: {err:#}",
+                    key.server_id,
+                    key.workspace_root.display(),
+                    server_match.file_path.display()
+                );
+                self.mark_client_broken_and_restart(key, err.to_string())
+                    .await;
+                continue;
+            }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+        }
+
+        Ok(())
+    }
+
     pub async fn status_for_file(&self, file_path: &Path, base_dir: &Path) -> Vec<LspStatus> {
         let matches = self.matching_server_matches(file_path, base_dir).await;
         let mut statuses = Vec::new();

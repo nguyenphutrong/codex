@@ -38,6 +38,7 @@ pub(crate) async fn enrich_output_with_lsp_diagnostics(
 
     for file_path in &candidate_files {
         let _ = lsp_manager.touch_file(file_path, &turn.cwd, true).await;
+        let _ = lsp_manager.did_save_file(file_path, &turn.cwd).await;
     }
 
     let formatted = format_lsp_diagnostics(
