@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::sandboxing::SandboxPermissions;
+use crate::tools::lsp_enrichment::GitStatusSnapshot;
 
 mod async_watcher;
 mod errors;
@@ -119,6 +120,7 @@ pub(crate) struct UnifiedExecResponse {
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
     pub session_command: Option<Vec<String>>,
+    pub git_status_snapshot: Option<GitStatusSnapshot>,
 }
 
 #[derive(Default)]
@@ -161,6 +163,7 @@ struct ProcessEntry {
     process_id: String,
     command: Vec<String>,
     tty: bool,
+    git_status_snapshot: Option<GitStatusSnapshot>,
     network_approval_id: Option<String>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,

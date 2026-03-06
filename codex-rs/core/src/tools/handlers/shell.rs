@@ -24,6 +24,9 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
+use crate::tools::lsp_enrichment::capture_git_status_snapshot;
+use crate::tools::lsp_enrichment::diff_git_status_snapshots;
+use crate::tools::lsp_enrichment::enrich_output_with_lsp_diagnostics;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -422,6 +425,11 @@ impl ShellHandler {
             call_id: call_id.clone(),
             tool_name,
         };
+        let before_git_snapshot = if session.services.lsp_manager.is_some() {
+            capture_git_status_snapshot(exec_params.cwd.as_path()).await
+        } else {
+            None
+        };
         let out = orchestrator
             .run(
                 &mut runtime,
@@ -432,8 +440,26 @@ impl ShellHandler {
             )
             .await
             .map(|result| result.output);
+        let changed_files = if out.is_ok() {
+            match (
+                before_git_snapshot.as_ref(),
+                capture_git_status_snapshot(exec_params.cwd.as_path()).await.as_ref(),
+            ) {
+                (Some(before), Some(after)) => diff_git_status_snapshots(before, after),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, None);
         let content = emitter.finish(event_ctx, out).await?;
+        let content = enrich_output_with_lsp_diagnostics(
+            session.as_ref(),
+            turn.as_ref(),
+            content,
+            &changed_files,
+        )
+        .await;
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
             success: Some(true),

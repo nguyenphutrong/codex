@@ -1,6 +1,5 @@
 use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::path::Path;
 
 use crate::apply_patch;
@@ -23,6 +22,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::lsp_enrichment::enrich_output_with_lsp_diagnostics;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
@@ -31,15 +31,12 @@ use crate::tools::spec::JsonSchema;
 use async_trait::async_trait;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
-use codex_lsp::LspDiagnostic;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::sync::Arc;
 
 pub struct ApplyPatchHandler;
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("tool_apply_patch.lark");
-const MAX_LSP_DIAGNOSTIC_FILES: usize = 5;
-const MAX_LSP_DIAGNOSTICS_PER_FILE: usize = 20;
 
 fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<AbsolutePathBuf> {
     let mut keys = Vec::new();
@@ -63,18 +60,6 @@ fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<AbsolutePathBuf> {
 
 fn to_abs_path(cwd: &Path, path: &Path) -> Option<AbsolutePathBuf> {
     AbsolutePathBuf::resolve_path_against_base(path, cwd).ok()
-}
-
-fn diagnostic_candidate_files(touched_files: &[AbsolutePathBuf]) -> Vec<std::path::PathBuf> {
-    let mut candidate_files = touched_files
-        .iter()
-        .map(AbsolutePathBuf::to_path_buf)
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
-    candidate_files.sort();
-    candidate_files.dedup();
-    candidate_files.truncate(MAX_LSP_DIAGNOSTIC_FILES);
-    candidate_files
 }
 
 #[async_trait]
@@ -128,11 +113,14 @@ impl ToolHandler for ApplyPatchHandler {
                 match apply_patch::apply_patch(turn.as_ref(), changes).await {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
-                        let content = enrich_apply_patch_output_with_lsp_diagnostics(
+                        let content = enrich_output_with_lsp_diagnostics(
                             session.as_ref(),
                             turn.as_ref(),
                             content,
-                            &touched_files,
+                            &touched_files
+                                .iter()
+                                .map(AbsolutePathBuf::to_path_buf)
+                                .collect::<Vec<_>>(),
                         )
                         .await;
                         Ok(ToolOutput::Function {
@@ -187,11 +175,14 @@ impl ToolHandler for ApplyPatchHandler {
                             Some(&tracker),
                         );
                         let content = emitter.finish(event_ctx, out).await?;
-                        let content = enrich_apply_patch_output_with_lsp_diagnostics(
+                        let content = enrich_output_with_lsp_diagnostics(
                             session.as_ref(),
                             turn.as_ref(),
                             content,
-                            &file_paths,
+                            &file_paths
+                                .iter()
+                                .map(AbsolutePathBuf::to_path_buf)
+                                .collect::<Vec<_>>(),
                         )
                         .await;
                         Ok(ToolOutput::Function {
@@ -246,11 +237,14 @@ pub(crate) async fn intercept_apply_patch(
             match apply_patch::apply_patch(turn.as_ref(), changes).await {
                 InternalApplyPatchInvocation::Output(item) => {
                     let content = item?;
-                    let content = enrich_apply_patch_output_with_lsp_diagnostics(
+                    let content = enrich_output_with_lsp_diagnostics(
                         session.as_ref(),
                         turn.as_ref(),
                         content,
-                        &touched_files,
+                        &touched_files
+                            .iter()
+                            .map(AbsolutePathBuf::to_path_buf)
+                            .collect::<Vec<_>>(),
                     )
                     .await;
                     Ok(Some(ToolOutput::Function {
@@ -304,11 +298,14 @@ pub(crate) async fn intercept_apply_patch(
                         tracker.as_ref().copied(),
                     );
                     let content = emitter.finish(event_ctx, out).await?;
-                    let content = enrich_apply_patch_output_with_lsp_diagnostics(
+                    let content = enrich_output_with_lsp_diagnostics(
                         session.as_ref(),
                         turn.as_ref(),
                         content,
-                        &approval_keys,
+                        &approval_keys
+                            .iter()
+                            .map(AbsolutePathBuf::to_path_buf)
+                            .collect::<Vec<_>>(),
                     )
                     .await;
                     Ok(Some(ToolOutput::Function {
@@ -329,93 +326,6 @@ pub(crate) async fn intercept_apply_patch(
         }
         codex_apply_patch::MaybeApplyPatchVerified::NotApplyPatch => Ok(None),
     }
-}
-
-async fn enrich_apply_patch_output_with_lsp_diagnostics(
-    session: &Session,
-    turn: &TurnContext,
-    content: String,
-    touched_files: &[AbsolutePathBuf],
-) -> String {
-    let Some(lsp_manager) = session.services.lsp_manager.as_ref() else {
-        return content;
-    };
-
-    let candidate_files = diagnostic_candidate_files(touched_files);
-    if candidate_files.is_empty() {
-        return content;
-    }
-
-    for file_path in &candidate_files {
-        let _ = lsp_manager.touch_file(file_path, &turn.cwd, true).await;
-    }
-
-    let formatted = format_lsp_diagnostics(
-        &turn.cwd,
-        lsp_manager
-            .diagnostics_for_paths(&candidate_files, &turn.cwd)
-            .await,
-    );
-    if formatted.is_empty() {
-        return content;
-    }
-
-    format!("{content}\n\n{formatted}")
-}
-
-fn format_lsp_diagnostics(
-    cwd: &Path,
-    diagnostics: std::collections::HashMap<std::path::PathBuf, Vec<LspDiagnostic>>,
-) -> String {
-    let mut seen = HashSet::new();
-    let mut entries = diagnostics
-        .into_iter()
-        .filter_map(|(path, values)| {
-            let errors = values
-                .into_iter()
-                .filter(|diagnostic| diagnostic.severity == Some(1))
-                .filter_map(|diagnostic| {
-                    let key = (
-                        path.clone(),
-                        diagnostic.range.start.line,
-                        diagnostic.range.start.character,
-                        diagnostic.message.clone(),
-                    );
-                    seen.insert(key).then_some(diagnostic)
-                })
-                .take(MAX_LSP_DIAGNOSTICS_PER_FILE)
-                .collect::<Vec<_>>();
-            (!errors.is_empty()).then_some((path, errors))
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries.truncate(MAX_LSP_DIAGNOSTIC_FILES);
-
-    entries
-        .into_iter()
-        .map(|(path, errors)| {
-            let label = path
-                .strip_prefix(cwd)
-                .ok()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            let body = errors
-                .iter()
-                .map(|diagnostic| {
-                    format!(
-                        "ERROR [{}:{}] {}",
-                        diagnostic.range.start.line, diagnostic.range.start.character, diagnostic.message
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "LSP errors detected in {label}, please fix:\n<diagnostics file=\"{}\">\n{body}\n</diagnostics>",
-                path.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
 }
 
 /// Returns a custom tool that can be used to edit files. Well-suited for GPT-5 models
@@ -520,180 +430,6 @@ It is important to remember:
             additional_properties: Some(false.into()),
         },
     })
-}
-
-#[cfg(test)]
-mod lsp_output_tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use std::collections::HashMap;
-    use tempfile::tempdir;
-
-    #[test]
-    fn format_lsp_diagnostics_only_includes_errors() {
-        let cwd = tempdir().expect("cwd");
-        let file_path = cwd.path().join("src/main.rs");
-        let output = format_lsp_diagnostics(
-            cwd.path(),
-            HashMap::from([(
-                file_path.clone(),
-                vec![
-                    LspDiagnostic {
-                        path: file_path.clone(),
-                        range: codex_lsp::LspRange {
-                            start: codex_lsp::LspPosition {
-                                line: 3,
-                                character: 7,
-                            },
-                            end: codex_lsp::LspPosition {
-                                line: 3,
-                                character: 9,
-                            },
-                        },
-                        severity: Some(2),
-                        message: "warning".to_string(),
-                        source: None,
-                    },
-                    LspDiagnostic {
-                        path: file_path.clone(),
-                        range: codex_lsp::LspRange {
-                            start: codex_lsp::LspPosition {
-                                line: 4,
-                                character: 2,
-                            },
-                            end: codex_lsp::LspPosition {
-                                line: 4,
-                                character: 4,
-                            },
-                        },
-                        severity: Some(1),
-                        message: "boom".to_string(),
-                        source: None,
-                    },
-                ],
-            )]),
-        );
-
-        assert_eq!(
-            output,
-            format!(
-                "LSP errors detected in src/main.rs, please fix:\n<diagnostics file=\"{}\">\nERROR [4:2] boom\n</diagnostics>",
-                file_path.display()
-            )
-        );
-    }
-
-    #[test]
-    fn format_lsp_diagnostics_deduplicates_errors() {
-        let cwd = tempdir().expect("cwd");
-        let file_path = cwd.path().join("src/main.rs");
-        let output = format_lsp_diagnostics(
-            cwd.path(),
-            HashMap::from([(
-                file_path.clone(),
-                vec![
-                    LspDiagnostic {
-                        path: file_path.clone(),
-                        range: codex_lsp::LspRange {
-                            start: codex_lsp::LspPosition {
-                                line: 4,
-                                character: 2,
-                            },
-                            end: codex_lsp::LspPosition {
-                                line: 4,
-                                character: 3,
-                            },
-                        },
-                        severity: Some(1),
-                        message: "duplicate".to_string(),
-                        source: None,
-                    },
-                    LspDiagnostic {
-                        path: file_path.clone(),
-                        range: codex_lsp::LspRange {
-                            start: codex_lsp::LspPosition {
-                                line: 4,
-                                character: 2,
-                            },
-                            end: codex_lsp::LspPosition {
-                                line: 4,
-                                character: 3,
-                            },
-                        },
-                        severity: Some(1),
-                        message: "duplicate".to_string(),
-                        source: None,
-                    },
-                    LspDiagnostic {
-                        path: file_path,
-                        range: codex_lsp::LspRange {
-                            start: codex_lsp::LspPosition {
-                                line: 5,
-                                character: 1,
-                            },
-                            end: codex_lsp::LspPosition {
-                                line: 5,
-                                character: 2,
-                            },
-                        },
-                        severity: Some(1),
-                        message: "next".to_string(),
-                        source: None,
-                    },
-                ],
-            )]),
-        );
-
-        assert_eq!(output.matches("ERROR [4:2] duplicate").count(), 1);
-        assert!(output.contains("ERROR [5:1] next"));
-    }
-
-    #[test]
-    fn format_lsp_diagnostics_limits_error_count_per_file() {
-        let cwd = tempdir().expect("cwd");
-        let file_path = cwd.path().join("src/main.rs");
-
-        let mut diagnostics = Vec::new();
-        for line in 1..=25 {
-            diagnostics.push(LspDiagnostic {
-                path: file_path.clone(),
-                range: codex_lsp::LspRange {
-                    start: codex_lsp::LspPosition { line, character: 1 },
-                    end: codex_lsp::LspPosition { line, character: 2 },
-                },
-                severity: Some(1),
-                message: format!("error-{line}"),
-                source: None,
-            });
-        }
-
-        let output = format_lsp_diagnostics(cwd.path(), HashMap::from([(file_path, diagnostics)]));
-        let visible_errors = output
-            .lines()
-            .filter(|line| line.starts_with("ERROR "))
-            .count();
-        assert_eq!(visible_errors, MAX_LSP_DIAGNOSTICS_PER_FILE);
-    }
-
-    #[test]
-    fn diagnostic_candidate_files_deduplicates_and_limits_files() {
-        let cwd = tempdir().expect("cwd");
-        let mut touched_files = Vec::new();
-        for idx in 0..7 {
-            let file_path = cwd.path().join(format!("src/file-{idx}.rs"));
-            std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create dir");
-            std::fs::write(&file_path, "fn main() {}\n").expect("write file");
-            touched_files.push(AbsolutePathBuf::try_from(file_path.clone()).expect("abs file"));
-            if idx == 0 {
-                touched_files.push(AbsolutePathBuf::try_from(file_path).expect("dup file"));
-            }
-        }
-
-        let files = diagnostic_candidate_files(&touched_files);
-        assert_eq!(files.len(), MAX_LSP_DIAGNOSTIC_FILES);
-        assert_eq!(files[0], cwd.path().join("src/file-0.rs"));
-        assert_eq!(files[4], cwd.path().join("src/file-4.rs"));
-    }
 }
 
 #[cfg(test)]

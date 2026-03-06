@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
@@ -38,7 +39,10 @@ const DIAGNOSTICS_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const DIAGNOSTICS_SETTLE_DELAY: Duration = Duration::from_millis(150);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
-const BROKEN_CLIENT_TTL: Duration = Duration::from_secs(30);
+const CLIENT_BACKOFF_FIRST_FAILURE: Duration = Duration::from_secs(30);
+const CLIENT_BACKOFF_SECOND_FAILURE: Duration = Duration::from_secs(120);
+const CLIENT_BACKOFF_MAX_FAILURE: Duration = Duration::from_secs(600);
+const CLIENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspConfig {
@@ -56,12 +60,22 @@ pub struct ServerConfig {
     pub root_markers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspClientState {
+    Starting,
+    Connected,
+    Broken,
+    Closed,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LspStatus {
     pub server: String,
     pub workspace_root: PathBuf,
-    pub connected: bool,
-    pub broken: bool,
+    pub state: LspClientState,
+    pub retry_after_seconds: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -104,7 +118,8 @@ pub struct PositionRequest {
 pub struct SessionManager {
     config: Option<Arc<LspConfig>>,
     clients: Arc<RwLock<HashMap<ClientKey, Arc<ClientHandle>>>>,
-    broken_clients: Arc<Mutex<HashMap<ClientKey, Instant>>>,
+    client_health: Arc<RwLock<HashMap<ClientKey, ClientHealth>>>,
+    client_locks: Arc<Mutex<HashMap<ClientKey, Arc<Mutex<()>>>>>,
 }
 
 impl SessionManager {
@@ -112,7 +127,8 @@ impl SessionManager {
         Self {
             config: config.map(Arc::new),
             clients: Arc::new(RwLock::new(HashMap::new())),
-            broken_clients: Arc::new(Mutex::new(HashMap::new())),
+            client_health: Arc::new(RwLock::new(HashMap::new())),
+            client_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -139,22 +155,33 @@ impl SessionManager {
             let Ok(client) = self.client_for_match(&server_match).await else {
                 continue;
             };
-            let previous_revision = client.diagnostic_revision(&server_match.file_path).await;
-            if let Err(err) = client.open_or_change(&server_match.file_path).await {
+            let touch_revision = match client.open_or_change(&server_match.file_path).await {
+                Ok(touch_revision) => touch_revision,
+                Err(err) => {
+                    warn!(
+                        "LSP client {} in {} failed to open {}: {err:#}",
+                        key.server_id,
+                        key.workspace_root.display(),
+                        server_match.file_path.display()
+                    );
+                    self.mark_client_broken(key, err.to_string()).await;
+                    continue;
+                }
+            };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
+
+            if wait_for_diagnostics
+                && let Err(err) = client
+                    .wait_for_diagnostics(&server_match.file_path, touch_revision)
+                    .await
+            {
                 warn!(
-                    "LSP client {} in {} failed to open {}: {err:#}",
+                    "LSP client {} in {} did not receive fresh diagnostics for {}: {err:#}",
                     key.server_id,
                     key.workspace_root.display(),
                     server_match.file_path.display()
                 );
-                self.mark_client_broken(key).await;
-                continue;
-            }
-
-            if wait_for_diagnostics {
-                let _ = client
-                    .wait_for_diagnostics(&server_match.file_path, previous_revision)
-                    .await;
             }
         }
 
@@ -191,23 +218,23 @@ impl SessionManager {
 
     pub async fn status_for_file(&self, file_path: &Path, base_dir: &Path) -> Vec<LspStatus> {
         let matches = self.matching_server_matches(file_path, base_dir).await;
-        let connected_clients = self
-            .clients
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
         let mut statuses = Vec::new();
 
         for server_match in matches {
             let key = self.client_key(&server_match);
-            let broken = self.is_broken_client(&key).await;
+            self.reconcile_client_health(&key).await;
+            let health = self.client_health(&key).await.unwrap_or_default();
+            let retry_after_seconds = health.retry_at.and_then(|retry_at| {
+                retry_at
+                    .checked_duration_since(Instant::now())
+                    .map(|duration| duration.as_secs())
+            });
             statuses.push(LspStatus {
                 server: server_match.server.id.clone(),
                 workspace_root: server_match.workspace_root,
-                connected: !broken && connected_clients.contains(&key),
-                broken,
+                state: health.state,
+                retry_after_seconds,
+                last_error: health.last_error,
             });
         }
 
@@ -392,9 +419,11 @@ impl SessionManager {
                     key.workspace_root.display(),
                     server_match.file_path.display()
                 );
-                self.mark_client_broken(key).await;
+                self.mark_client_broken(key, err.to_string()).await;
                 continue;
             }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
 
             let payload = match client
                 .send_request(
@@ -414,10 +443,12 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display()
                     );
-                    self.mark_client_broken(key).await;
+                    self.mark_client_broken(key, err.to_string()).await;
                     continue;
                 }
             };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
 
             results.push(LspOperationResult {
                 server: server_match.server.id.clone(),
@@ -501,10 +532,12 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display()
                     );
-                    self.mark_client_broken(key).await;
+                    self.mark_client_broken(key, err.to_string()).await;
                     continue;
                 }
             };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
 
             results.push(LspOperationResult {
                 server: server_match.server.id.clone(),
@@ -626,9 +659,11 @@ impl SessionManager {
                     server_match.file_path.display(),
                     operation
                 );
-                self.mark_client_broken(key.clone()).await;
+                self.mark_client_broken(key.clone(), err.to_string()).await;
                 continue;
             }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
 
             let prepared = match client
                 .send_request(
@@ -649,7 +684,7 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display(),
                     );
-                    self.mark_client_broken(key.clone()).await;
+                    self.mark_client_broken(key.clone(), err.to_string()).await;
                     continue;
                 }
             };
@@ -681,10 +716,12 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display(),
                     );
-                    self.mark_client_broken(key).await;
+                    self.mark_client_broken(key, err.to_string()).await;
                     continue;
                 }
             };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
 
             results.push(LspOperationResult {
                 server: server_match.server.id.clone(),
@@ -745,9 +782,11 @@ impl SessionManager {
                     server_match.file_path.display(),
                     operation_name
                 );
-                self.mark_client_broken(key.clone()).await;
+                self.mark_client_broken(key.clone(), err.to_string()).await;
                 continue;
             }
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
 
             let payload = match operation(
                 client,
@@ -766,10 +805,12 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display(),
                     );
-                    self.mark_client_broken(key).await;
+                    self.mark_client_broken(key, err.to_string()).await;
                     continue;
                 }
             };
+            self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+                .await;
             results.push(RawOperationResult {
                 server: server_match.server.id.clone(),
                 workspace_root: server_match.workspace_root,
@@ -786,18 +827,39 @@ impl SessionManager {
 
     async fn client_for_match(&self, server_match: &ServerMatch) -> Result<Arc<ClientHandle>> {
         let key = self.client_key(server_match);
-
-        if self.is_broken_client(&key).await {
+        self.reconcile_client_health(&key).await;
+        if let Some(retry_after_seconds) = self.retry_after_seconds(&key).await {
             return Err(anyhow!(
-                "LSP server {} is temporarily unavailable for {}. Retry later.",
+                "LSP server {} is temporarily unavailable for {}. Retry later in {}s.",
                 key.server_id,
-                key.workspace_root.display()
+                key.workspace_root.display(),
+                retry_after_seconds,
             ));
         }
 
         if let Some(existing) = self.clients.read().await.get(&key).cloned() {
             return Ok(existing);
         }
+
+        let client_lock = self.client_lock(&key).await;
+        let _guard = client_lock.lock().await;
+
+        self.reconcile_client_health(&key).await;
+        if let Some(retry_after_seconds) = self.retry_after_seconds(&key).await {
+            return Err(anyhow!(
+                "LSP server {} is temporarily unavailable for {}. Retry later in {}s.",
+                key.server_id,
+                key.workspace_root.display(),
+                retry_after_seconds,
+            ));
+        }
+
+        if let Some(existing) = self.clients.read().await.get(&key).cloned() {
+            return Ok(existing);
+        }
+
+        self.mark_client_starting(&server_match.server.id, &server_match.workspace_root)
+            .await;
 
         let client = match ClientHandle::spawn(
             server_match.server.clone(),
@@ -812,7 +874,7 @@ impl SessionManager {
                     key.server_id,
                     key.workspace_root.display()
                 );
-                self.mark_client_broken(key.clone()).await;
+                self.mark_client_broken(key.clone(), err.to_string()).await;
                 return Err(err);
             }
         };
@@ -821,6 +883,8 @@ impl SessionManager {
             .write()
             .await
             .insert(key.clone(), client.clone());
+        self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
+            .await;
         Ok(client)
     }
 
@@ -831,21 +895,85 @@ impl SessionManager {
         }
     }
 
-    async fn is_broken_client(&self, key: &ClientKey) -> bool {
-        let mut broken_clients = self.broken_clients.lock().await;
-        match broken_clients.get(key) {
-            Some(since) if since.elapsed() <= BROKEN_CLIENT_TTL => true,
-            Some(_) => {
-                broken_clients.remove(key);
-                false
-            }
-            None => false,
-        }
+    async fn retry_after_seconds(&self, key: &ClientKey) -> Option<u64> {
+        let health = self.client_health(key).await?;
+        let retry_at = health.retry_at?;
+        retry_at
+            .checked_duration_since(Instant::now())
+            .map(|duration| duration.as_secs())
     }
 
-    async fn mark_client_broken(&self, key: ClientKey) {
-        self.clients.write().await.remove(&key);
-        self.broken_clients.lock().await.insert(key, Instant::now());
+    async fn is_retry_blocked(&self, key: &ClientKey) -> bool {
+        self.retry_after_seconds(key).await.is_some()
+    }
+
+    async fn client_health(&self, key: &ClientKey) -> Option<ClientHealth> {
+        self.client_health.read().await.get(key).cloned()
+    }
+
+    async fn client_lock(&self, key: &ClientKey) -> Arc<Mutex<()>> {
+        let mut locks = self.client_locks.lock().await;
+        locks.entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn reconcile_client_health(&self, key: &ClientKey) {
+        let Some(client) = self.clients.read().await.get(key).cloned() else {
+            return;
+        };
+        if client.is_running() {
+            return;
+        }
+
+        self.mark_client_broken(key.clone(), "LSP connection closed".to_string())
+            .await;
+    }
+
+    async fn mark_client_starting(&self, server_id: &str, workspace_root: &Path) {
+        let key = ClientKey {
+            server_id: server_id.to_string(),
+            workspace_root: workspace_root.to_path_buf(),
+        };
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.state = LspClientState::Starting;
+        entry.retry_at = None;
+    }
+
+    async fn mark_client_success(&self, server_id: &str, workspace_root: &Path) {
+        let key = ClientKey {
+            server_id: server_id.to_string(),
+            workspace_root: workspace_root.to_path_buf(),
+        };
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.state = LspClientState::Connected;
+        entry.failure_count = 0;
+        entry.retry_at = None;
+        entry.last_error = None;
+        entry.last_success_at = Some(SystemTime::now());
+    }
+
+    async fn mark_client_closed(&self, key: &ClientKey) {
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key.clone()).or_default();
+        entry.state = LspClientState::Closed;
+        entry.retry_at = None;
+        entry.last_error = None;
+    }
+
+    async fn mark_client_broken(&self, key: ClientKey, error: String) {
+        if let Some(client) = self.clients.write().await.remove(&key) {
+            drop(client);
+        }
+
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.failure_count = entry.failure_count.saturating_add(1);
+        entry.state = LspClientState::Broken;
+        entry.last_error = Some(error);
+        entry.retry_at = Some(Instant::now() + backoff_for_failure(entry.failure_count));
     }
 
     async fn matching_server_matches(&self, file_path: &Path, base_dir: &Path) -> Vec<ServerMatch> {
@@ -899,9 +1027,7 @@ impl SessionManager {
             if !workspace_roots_overlap(&key.workspace_root, base_dir) {
                 continue;
             }
-            if self.is_broken_client(&key).await {
-                continue;
-            }
+            self.reconcile_client_health(&key).await;
             let Some(server) = config
                 .servers
                 .iter()
@@ -919,6 +1045,19 @@ impl SessionManager {
 
         matches.sort_by(|a, b| a.server.id.cmp(&b.server.id));
         matches
+    }
+
+    async fn shutdown(&self) {
+        let clients = self
+            .clients
+            .write()
+            .await
+            .drain()
+            .collect::<Vec<(ClientKey, Arc<ClientHandle>)>>();
+        for (key, client) in clients {
+            self.mark_client_closed(&key).await;
+            client.shutdown().await;
+        }
     }
 }
 
@@ -942,24 +1081,92 @@ struct ClientKey {
     workspace_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ClientHealth {
+    state: LspClientState,
+    failure_count: u32,
+    retry_at: Option<Instant>,
+    last_error: Option<String>,
+    last_success_at: Option<SystemTime>,
+}
+
+impl Default for ClientHealth {
+    fn default() -> Self {
+        Self {
+            state: LspClientState::Closed,
+            failure_count: 0,
+            retry_at: None,
+            last_error: None,
+            last_success_at: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ClientHandle {
     workspace_root: PathBuf,
     initialization: Option<Value>,
     writer_tx: mpsc::UnboundedSender<Value>,
     state: Arc<ClientState>,
-    child: Option<Mutex<Child>>,
+    child: Option<Arc<Mutex<Child>>>,
 }
 
 #[derive(Debug)]
 struct ClientState {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
-    diagnostics: RwLock<HashMap<PathBuf, Vec<LspDiagnostic>>>,
-    diagnostics_revision_by_path: Mutex<HashMap<PathBuf, u64>>,
+    diagnostics: RwLock<HashMap<PathBuf, CachedDiagnostics>>,
     opened_versions: Mutex<HashMap<PathBuf, i32>>,
+    sync_capabilities: RwLock<TextDocumentSyncCapabilities>,
     next_request_id: AtomicU64,
-    next_diagnostics_revision: AtomicU64,
+    next_state_revision: AtomicU64,
     diagnostics_notify: Notify,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CachedDiagnostics {
+    diagnostics: Vec<LspDiagnostic>,
+    last_touch_revision: u64,
+    last_publish_revision: u64,
+    pending_stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDocumentChangeKind {
+    None,
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextDocumentSaveCapabilities {
+    supported: bool,
+    include_text: bool,
+}
+
+impl Default for TextDocumentSaveCapabilities {
+    fn default() -> Self {
+        Self {
+            supported: false,
+            include_text: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextDocumentSyncCapabilities {
+    open_close: bool,
+    change: TextDocumentChangeKind,
+    save: TextDocumentSaveCapabilities,
+}
+
+impl Default for TextDocumentSyncCapabilities {
+    fn default() -> Self {
+        Self {
+            open_close: true,
+            change: TextDocumentChangeKind::Full,
+            save: TextDocumentSaveCapabilities::default(),
+        }
+    }
 }
 
 impl ClientHandle {
@@ -1016,10 +1223,10 @@ impl ClientHandle {
         let state = Arc::new(ClientState {
             pending: Mutex::new(HashMap::new()),
             diagnostics: RwLock::new(HashMap::new()),
-            diagnostics_revision_by_path: Mutex::new(HashMap::new()),
             opened_versions: Mutex::new(HashMap::new()),
+            sync_capabilities: RwLock::new(TextDocumentSyncCapabilities::default()),
             next_request_id: AtomicU64::new(0),
-            next_diagnostics_revision: AtomicU64::new(0),
+            next_state_revision: AtomicU64::new(0),
             diagnostics_notify: Notify::new(),
         });
 
@@ -1038,7 +1245,7 @@ impl ClientHandle {
             initialization,
             writer_tx,
             state,
-            child: child.map(Mutex::new),
+            child: child.map(|child| Arc::new(Mutex::new(child))),
         });
 
         let reader_client = client.clone();
@@ -1067,7 +1274,7 @@ impl ClientHandle {
 
     async fn initialize(&self) -> Result<()> {
         let root_uri = path_to_uri(&self.workspace_root)?;
-        timeout(
+        let initialize_result = timeout(
             INITIALIZE_TIMEOUT,
             self.send_request(
                 "initialize",
@@ -1104,6 +1311,10 @@ impl ClientHandle {
         )
         .await
         .context("initialize timed out")??;
+        self.set_sync_capabilities(parse_sync_capabilities(
+            initialize_result.get("capabilities"),
+        ))
+        .await;
 
         self.send_notification("initialized", json!({})).await?;
         if let Some(initialization) = self.initialization.clone() {
@@ -1119,11 +1330,13 @@ impl ClientHandle {
         Ok(())
     }
 
-    async fn open_or_change(&self, file_path: &Path) -> Result<()> {
+    async fn open_or_change(&self, file_path: &Path) -> Result<u64> {
         let text = fs::read_to_string(file_path)
             .await
             .with_context(|| format!("failed to read {}", file_path.display()))?;
         let uri = path_to_uri(file_path)?;
+        let touch_revision = self.mark_touch_pending(file_path).await;
+        let sync_capabilities = *self.state.sync_capabilities.read().await;
         let mut opened_versions = self.state.opened_versions.lock().await;
 
         if let Some(version) = opened_versions.get_mut(file_path) {
@@ -1138,20 +1351,26 @@ impl ClientHandle {
                 }),
             )
             .await?;
-            self.send_notification(
-                "textDocument/didChange",
-                json!({
-                    "textDocument": {
-                        "uri": path_to_uri(file_path)?,
-                        "version": *version,
-                    },
-                    "contentChanges": [{
-                        "text": text,
-                    }],
-                }),
-            )
-            .await?;
-            return Ok(());
+            if sync_capabilities.change != TextDocumentChangeKind::None {
+                self.send_notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {
+                            "uri": path_to_uri(file_path)?,
+                            "version": *version,
+                        },
+                        "contentChanges": [{
+                            "text": text,
+                        }],
+                    }),
+                )
+                .await?;
+            }
+            if sync_capabilities.save.supported {
+                self.send_did_save(file_path, &text, sync_capabilities.save.include_text)
+                    .await?;
+            }
+            return Ok(touch_revision);
         }
 
         opened_versions.insert(file_path.to_path_buf(), 0);
@@ -1165,18 +1384,25 @@ impl ClientHandle {
             }),
         )
         .await?;
-        self.send_notification(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": path_to_uri(file_path)?,
-                    "languageId": language_id_for_path(file_path),
-                    "version": 0,
-                    "text": text,
-                },
-            }),
-        )
-        .await
+        if sync_capabilities.open_close {
+            self.send_notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": path_to_uri(file_path)?,
+                        "languageId": language_id_for_path(file_path),
+                        "version": 0,
+                        "text": text,
+                    },
+                }),
+            )
+            .await?;
+        }
+        if sync_capabilities.save.supported {
+            self.send_did_save(file_path, &text, sync_capabilities.save.include_text)
+                .await?;
+        }
+        Ok(touch_revision)
     }
 
     async fn diagnostics_for_path(&self, file_path: &Path) -> Vec<LspDiagnostic> {
@@ -1185,34 +1411,44 @@ impl ClientHandle {
             .read()
             .await
             .get(file_path)
-            .cloned()
+            .filter(|cached| {
+                !cached.pending_stale && cached.last_publish_revision > cached.last_touch_revision
+            })
+            .map(|cached| cached.diagnostics.clone())
             .unwrap_or_default()
     }
 
-    async fn diagnostic_revision(&self, file_path: &Path) -> u64 {
+    async fn last_publish_revision(&self, file_path: &Path) -> u64 {
         self.state
-            .diagnostics_revision_by_path
-            .lock()
+            .diagnostics
+            .read()
             .await
             .get(file_path)
-            .copied()
+            .map(|cached| cached.last_publish_revision)
             .unwrap_or_default()
     }
 
-    async fn wait_for_diagnostics(&self, file_path: &Path, previous_revision: u64) -> Result<()> {
+    async fn wait_for_diagnostics(&self, file_path: &Path, touch_revision: u64) -> Result<()> {
         let file_path = file_path.to_path_buf();
         timeout(DIAGNOSTICS_WAIT_TIMEOUT, async {
-            let mut observed_revision = previous_revision;
+            let mut observed_revision = self.last_publish_revision(&file_path).await;
             loop {
-                let current_revision = self.diagnostic_revision(&file_path).await;
-                if current_revision <= observed_revision {
+                let cached = self
+                    .state
+                    .diagnostics
+                    .read()
+                    .await
+                    .get(&file_path)
+                    .cloned()
+                    .unwrap_or_default();
+                if cached.pending_stale || cached.last_publish_revision <= touch_revision {
                     self.state.diagnostics_notify.notified().await;
                     continue;
                 }
 
-                observed_revision = current_revision;
+                observed_revision = cached.last_publish_revision;
                 tokio::time::sleep(DIAGNOSTICS_SETTLE_DELAY).await;
-                if self.diagnostic_revision(&file_path).await == observed_revision {
+                if self.last_publish_revision(&file_path).await == observed_revision {
                     break;
                 }
             }
@@ -1251,6 +1487,18 @@ impl ClientHandle {
             }))
             .map_err(|_| anyhow!("failed to send LSP notification {method}"))?;
         Ok(())
+    }
+
+    async fn send_did_save(&self, file_path: &Path, text: &str, include_text: bool) -> Result<()> {
+        let mut params = json!({
+            "textDocument": {
+                "uri": path_to_uri(file_path)?,
+            },
+        });
+        if include_text {
+            params["text"] = Value::String(text.to_string());
+        }
+        self.send_notification("textDocument/didSave", params).await
     }
 
     async fn handle_message(&self, message: Value) -> Result<()> {
@@ -1325,21 +1573,12 @@ impl ClientHandle {
             .filter_map(|diagnostic| diagnostic_from_value(&path, diagnostic))
             .collect::<Vec<_>>();
 
-        self.state
-            .diagnostics
-            .write()
-            .await
-            .insert(path.clone(), diagnostics);
-        let revision = self
-            .state
-            .next_diagnostics_revision
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        self.state
-            .diagnostics_revision_by_path
-            .lock()
-            .await
-            .insert(path, revision);
+        let revision = self.next_state_revision();
+        let mut cached = self.state.diagnostics.write().await;
+        let entry = cached.entry(path).or_default();
+        entry.diagnostics = diagnostics;
+        entry.last_publish_revision = revision;
+        entry.pending_stale = entry.last_publish_revision <= entry.last_touch_revision;
         self.state.diagnostics_notify.notify_waiters();
         Ok(())
     }
@@ -1374,13 +1613,96 @@ impl ClientHandle {
             let _ = sender.send(Err(anyhow!(message.to_string())));
         }
     }
+
+    async fn set_sync_capabilities(&self, capabilities: TextDocumentSyncCapabilities) {
+        *self.state.sync_capabilities.write().await = capabilities;
+    }
+
+    async fn mark_touch_pending(&self, file_path: &Path) -> u64 {
+        let revision = self.next_state_revision();
+        let mut diagnostics = self.state.diagnostics.write().await;
+        let entry = diagnostics.entry(file_path.to_path_buf()).or_default();
+        entry.last_touch_revision = revision;
+        entry.pending_stale = true;
+        revision
+    }
+
+    fn next_state_revision(&self) -> u64 {
+        self.state.next_state_revision.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn is_running(&self) -> bool {
+        let Some(child) = &self.child else {
+            return true;
+        };
+        let Ok(mut child) = child.try_lock() else {
+            return true;
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+
+    async fn shutdown(&self) {
+        let _ = timeout(REQUEST_TIMEOUT, self.send_request("shutdown", Value::Null)).await;
+        let _ = self.send_notification("exit", Value::Null).await;
+        let Some(child) = &self.child else {
+            return;
+        };
+        let Ok(mut child) = timeout(CLIENT_SHUTDOWN_TIMEOUT, child.lock()).await else {
+            return;
+        };
+        if timeout(CLIENT_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for SessionManager {
+    fn drop(&mut self) {
+        let manager = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                manager.shutdown().await;
+            });
+            return;
+        }
+
+        let clients = self
+            .clients
+            .try_write()
+            .ok()
+            .map(|mut clients| clients.drain().map(|(_, client)| client).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for client in clients {
+            if let Some(child) = client.child.as_ref()
+                && let Ok(mut child) = child.try_lock()
+            {
+                let _ = child.start_kill();
+            }
+        }
+    }
 }
 
 impl Drop for ClientHandle {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut()
-            && let Ok(mut child) = child.try_lock()
-        {
+        let Some(child) = self.child.clone() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let writer_tx = self.writer_tx.clone();
+            handle.spawn(async move {
+                let _ = writer_tx.send(json!({
+                    "jsonrpc": "2.0",
+                    "method": "exit",
+                    "params": {},
+                }));
+                let Ok(mut child) = timeout(CLIENT_SHUTDOWN_TIMEOUT, child.lock()).await else {
+                    return;
+                };
+                if timeout(CLIENT_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
+                    let _ = child.start_kill();
+                }
+            });
+        } else if let Ok(mut child) = child.try_lock() {
             let _ = child.start_kill();
         }
     }
@@ -1449,6 +1771,62 @@ fn resolve_workspace_root(file_path: &Path, root_markers: &[String], base_dir: &
 
 fn workspace_roots_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn backoff_for_failure(failure_count: u32) -> Duration {
+    match failure_count {
+        0 | 1 => CLIENT_BACKOFF_FIRST_FAILURE,
+        2 => CLIENT_BACKOFF_SECOND_FAILURE,
+        _ => CLIENT_BACKOFF_MAX_FAILURE,
+    }
+}
+
+fn parse_sync_capabilities(capabilities: Option<&Value>) -> TextDocumentSyncCapabilities {
+    let default = TextDocumentSyncCapabilities::default();
+    let Some(sync) = capabilities.and_then(|capabilities| capabilities.get("textDocumentSync")) else {
+        return default;
+    };
+
+    match sync {
+        Value::Number(number) => TextDocumentSyncCapabilities {
+            change: parse_change_kind(number.as_u64()),
+            ..default
+        },
+        Value::Object(object) => TextDocumentSyncCapabilities {
+            open_close: object
+                .get("openClose")
+                .and_then(Value::as_bool)
+                .unwrap_or(default.open_close),
+            change: parse_change_kind(object.get("change").and_then(Value::as_u64)),
+            save: parse_save_capabilities(object.get("save")),
+        },
+        _ => default,
+    }
+}
+
+fn parse_change_kind(change: Option<u64>) -> TextDocumentChangeKind {
+    match change {
+        Some(0) => TextDocumentChangeKind::None,
+        Some(2) => TextDocumentChangeKind::Incremental,
+        _ => TextDocumentChangeKind::Full,
+    }
+}
+
+fn parse_save_capabilities(save: Option<&Value>) -> TextDocumentSaveCapabilities {
+    match save {
+        Some(Value::Bool(supported)) => TextDocumentSaveCapabilities {
+            supported: *supported,
+            include_text: false,
+        },
+        Some(Value::Object(save)) => TextDocumentSaveCapabilities {
+            supported: true,
+            include_text: save
+                .get("includeText")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        _ => TextDocumentSaveCapabilities::default(),
+    }
 }
 
 fn resolve_command(command: &str) -> Result<PathBuf> {
