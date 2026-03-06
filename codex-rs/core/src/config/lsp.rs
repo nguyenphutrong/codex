@@ -90,23 +90,211 @@ fn custom_server(id: String, server: LspServerToml) -> io::Result<LspServerConfi
 fn built_in_servers() -> HashMap<String, LspServerConfig> {
     [
         (
+            "astro",
+            LspServerConfig {
+                id: "astro".to_string(),
+                command: "astro-ls".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [".astro"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "package.json",
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "bun.lock",
+                    "bun.lockb",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "bash",
+            LspServerConfig {
+                id: "bash".to_string(),
+                command: "bash-language-server".to_string(),
+                args: vec!["start".to_string()],
+                extensions: [".sh", ".bash", ".zsh", ".ksh"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: Vec::new(),
+            },
+        ),
+        (
             "clangd",
             LspServerConfig {
                 id: "clangd".to_string(),
                 command: "clangd".to_string(),
-                args: Vec::new(),
+                args: vec!["--background-index".to_string(), "--clang-tidy".to_string()],
                 extensions: [
-                    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".m", ".mm",
+                    ".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++", ".m",
+                    ".mm",
                 ]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
                 env: HashMap::new(),
                 initialization: None,
-                root_markers: ["compile_commands.json", ".clangd"]
+                root_markers: [
+                    "compile_commands.json",
+                    "compile_flags.txt",
+                    ".clangd",
+                    "CMakeLists.txt",
+                    "Makefile",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "clojure-lsp",
+            LspServerConfig {
+                id: "clojure-lsp".to_string(),
+                command: "clojure-lsp".to_string(),
+                args: vec!["listen".to_string()],
+                extensions: [".clj", ".cljs", ".cljc", ".edn"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "deps.edn",
+                    "project.clj",
+                    "shadow-cljs.edn",
+                    "bb.edn",
+                    "build.boot",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "csharp",
+            LspServerConfig {
+                id: "csharp".to_string(),
+                command: "csharp-ls".to_string(),
+                args: Vec::new(),
+                extensions: [".cs"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [".slnx", ".sln", ".csproj", "global.json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "dart",
+            LspServerConfig {
+                id: "dart".to_string(),
+                command: "dart".to_string(),
+                args: vec!["language-server".to_string(), "--lsp".to_string()],
+                extensions: [".dart"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["pubspec.yaml", "analysis_options.yaml"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "deno",
+            LspServerConfig {
+                id: "deno".to_string(),
+                command: "deno".to_string(),
+                args: vec!["lsp".to_string()],
+                extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["deno.json", "deno.jsonc"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "elixir-ls",
+            LspServerConfig {
+                id: "elixir-ls".to_string(),
+                command: "elixir-ls".to_string(),
+                args: Vec::new(),
+                extensions: [".ex", ".exs"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["mix.exs", "mix.lock"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "eslint",
+            LspServerConfig {
+                id: "eslint".to_string(),
+                command: "vscode-eslint-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [
+                    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "package.json",
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "bun.lock",
+                    "bun.lockb",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "fsharp",
+            LspServerConfig {
+                id: "fsharp".to_string(),
+                command: "fsautocomplete".to_string(),
+                args: Vec::new(),
+                extensions: [".fs", ".fsi", ".fsx", ".fsscript"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [".slnx", ".sln", ".fsproj", "global.json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "gleam",
+            LspServerConfig {
+                id: "gleam".to_string(),
+                command: "gleam".to_string(),
+                args: vec!["lsp".to_string()],
+                extensions: [".gleam"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["gleam.toml"].into_iter().map(str::to_string).collect(),
             },
         ),
         (
@@ -118,7 +306,22 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
                 extensions: [".go"].into_iter().map(str::to_string).collect(),
                 env: HashMap::new(),
                 initialization: None,
-                root_markers: ["go.mod", "go.work"]
+                root_markers: ["go.mod", "go.work", "go.sum"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "hls",
+            LspServerConfig {
+                id: "hls".to_string(),
+                command: "haskell-language-server-wrapper".to_string(),
+                args: vec!["--lsp".to_string()],
+                extensions: [".hs", ".lhs"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["stack.yaml", "cabal.project", "hie.yaml"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -144,6 +347,133 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
             },
         ),
         (
+            "jdtls",
+            LspServerConfig {
+                id: "jdtls".to_string(),
+                command: "jdtls".to_string(),
+                args: Vec::new(),
+                extensions: [".java"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "pom.xml",
+                    "build.gradle",
+                    "build.gradle.kts",
+                    ".project",
+                    ".classpath",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "julials",
+            LspServerConfig {
+                id: "julials".to_string(),
+                command: "julia".to_string(),
+                args: vec![
+                    "--startup-file=no".to_string(),
+                    "--history-file=no".to_string(),
+                    "-e".to_string(),
+                    "using LanguageServer; runserver()".to_string(),
+                ],
+                extensions: [".jl"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["Project.toml", "Manifest.toml"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "kotlin-ls",
+            LspServerConfig {
+                id: "kotlin-ls".to_string(),
+                command: "kotlin-lsp".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [".kt", ".kts"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "settings.gradle.kts",
+                    "settings.gradle",
+                    "build.gradle.kts",
+                    "build.gradle",
+                    "pom.xml",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "lua-ls",
+            LspServerConfig {
+                id: "lua-ls".to_string(),
+                command: "lua-language-server".to_string(),
+                args: Vec::new(),
+                extensions: [".lua"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    ".luarc.json",
+                    ".luarc.jsonc",
+                    ".luacheckrc",
+                    ".stylua.toml",
+                    "stylua.toml",
+                    "selene.toml",
+                    "selene.yml",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "nixd",
+            LspServerConfig {
+                id: "nixd".to_string(),
+                command: "nixd".to_string(),
+                args: Vec::new(),
+                extensions: [".nix"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["flake.nix", "default.nix", "shell.nix"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "ocaml-lsp",
+            LspServerConfig {
+                id: "ocaml-lsp".to_string(),
+                command: "ocamllsp".to_string(),
+                args: Vec::new(),
+                extensions: [".ml", ".mli"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["dune-project", "dune-workspace", ".merlin", "opam"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "prisma",
+            LspServerConfig {
+                id: "prisma".to_string(),
+                command: "prisma".to_string(),
+                args: vec!["language-server".to_string()],
+                extensions: [".prisma"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["schema.prisma"].into_iter().map(str::to_string).collect(),
+            },
+        ),
+        (
             "pyright",
             LspServerConfig {
                 id: "pyright".to_string(),
@@ -152,10 +482,32 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
                 extensions: [".py", ".pyi"].into_iter().map(str::to_string).collect(),
                 env: HashMap::new(),
                 initialization: None,
-                root_markers: ["pyproject.toml", "setup.py", "requirements.txt"]
+                root_markers: [
+                    "pyproject.toml",
+                    "setup.py",
+                    "setup.cfg",
+                    "requirements.txt",
+                    "Pipfile",
+                    "pyrightconfig.json",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "ruby-lsp",
+            LspServerConfig {
+                id: "ruby-lsp".to_string(),
+                command: "rubocop".to_string(),
+                args: vec!["--lsp".to_string()],
+                extensions: [".rb", ".rake", ".gemspec", ".ru"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["Gemfile"].into_iter().map(str::to_string).collect(),
             },
         ),
         (
@@ -192,6 +544,60 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
             },
         ),
         (
+            "svelte",
+            LspServerConfig {
+                id: "svelte".to_string(),
+                command: "svelteserver".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [".svelte"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "package.json",
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "bun.lock",
+                    "bun.lockb",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "terraform",
+            LspServerConfig {
+                id: "terraform".to_string(),
+                command: "terraform-ls".to_string(),
+                args: vec!["serve".to_string()],
+                extensions: [".tf", ".tfvars"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: Some(json!({
+                    "experimentalFeatures": {
+                        "prefillRequiredFields": true,
+                        "validateOnSave": true,
+                    },
+                })),
+                root_markers: [".terraform.lock.hcl", "terraform.tfstate"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        ),
+        (
+            "tinymist",
+            LspServerConfig {
+                id: "tinymist".to_string(),
+                command: "tinymist".to_string(),
+                args: Vec::new(),
+                extensions: [".typ", ".typc"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["typst.toml"].into_iter().map(str::to_string).collect(),
+            },
+        ),
+        (
             "typescript",
             LspServerConfig {
                 id: "typescript".to_string(),
@@ -214,6 +620,52 @@ fn built_in_servers() -> HashMap<String, LspServerConfig> {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            },
+        ),
+        (
+            "vue",
+            LspServerConfig {
+                id: "vue".to_string(),
+                command: "vue-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [".vue"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: [
+                    "package.json",
+                    "package-lock.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "bun.lock",
+                    "bun.lockb",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+        ),
+        (
+            "yaml-ls",
+            LspServerConfig {
+                id: "yaml-ls".to_string(),
+                command: "yaml-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                extensions: [".yaml", ".yml"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: Vec::new(),
+            },
+        ),
+        (
+            "zls",
+            LspServerConfig {
+                id: "zls".to_string(),
+                command: "zls".to_string(),
+                args: Vec::new(),
+                extensions: [".zig", ".zon"].into_iter().map(str::to_string).collect(),
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: ["build.zig"].into_iter().map(str::to_string).collect(),
             },
         ),
     ]
