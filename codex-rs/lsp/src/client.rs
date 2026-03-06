@@ -349,6 +349,19 @@ impl ClientHandle {
             .unwrap_or_default()
     }
 
+    pub(crate) async fn tracked_documents(&self) -> Vec<PathBuf> {
+        let mut documents = self
+            .state
+            .opened_versions
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        documents.sort();
+        documents
+    }
+
     pub(crate) async fn last_publish_revision(&self, file_path: &Path) -> u64 {
         self.state
             .diagnostics

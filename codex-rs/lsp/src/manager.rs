@@ -12,6 +12,7 @@ use crate::types::LspOperationResult;
 use crate::types::LspStatus;
 use crate::types::PositionRequest;
 use crate::types::ServerConfig;
+#[cfg(test)]
 use crate::util::backoff_for_failure;
 use crate::util::path_to_uri;
 use crate::util::resolve_absolute_path;
@@ -24,21 +25,36 @@ use anyhow::anyhow;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::time::Duration;
 use tracing::warn;
 
-#[derive(Debug, Clone, Default)]
+type SpawnClientFuture = Pin<Box<dyn Future<Output = Result<Arc<ClientHandle>>> + Send + 'static>>;
+type SpawnClientFn = dyn Fn(ServerConfig, PathBuf) -> SpawnClientFuture + Send + Sync;
+
+const CLIENT_RESTART_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+#[derive(Clone)]
 pub struct SessionManager {
     config: Option<Arc<LspConfig>>,
     pub(crate) clients: Arc<RwLock<HashMap<ClientKey, Arc<ClientHandle>>>>,
     pub(crate) client_health: Arc<RwLock<HashMap<ClientKey, ClientHealth>>>,
     client_locks: Arc<Mutex<HashMap<ClientKey, Arc<Mutex<()>>>>>,
+    drop_guard: Arc<()>,
+    spawn_client: Arc<SpawnClientFn>,
+    restart_backoff: [Duration; 3],
 }
 
 impl SessionManager {
@@ -48,6 +64,31 @@ impl SessionManager {
             clients: Arc::new(RwLock::new(HashMap::new())),
             client_health: Arc::new(RwLock::new(HashMap::new())),
             client_locks: Arc::new(Mutex::new(HashMap::new())),
+            drop_guard: Arc::new(()),
+            spawn_client: Arc::new(|server, workspace_root| {
+                Box::pin(ClientHandle::spawn(server, workspace_root))
+            }),
+            restart_backoff: CLIENT_RESTART_BACKOFF,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_options<F>(
+        config: Option<LspConfig>,
+        spawn_client: F,
+        restart_backoff: [Duration; 3],
+    ) -> Self
+    where
+        F: Fn(ServerConfig, PathBuf) -> SpawnClientFuture + Send + Sync + 'static,
+    {
+        Self {
+            config: config.map(Arc::new),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            client_health: Arc::new(RwLock::new(HashMap::new())),
+            client_locks: Arc::new(Mutex::new(HashMap::new())),
+            drop_guard: Arc::new(()),
+            spawn_client: Arc::new(spawn_client),
+            restart_backoff,
         }
     }
 
@@ -83,7 +124,8 @@ impl SessionManager {
                         key.workspace_root.display(),
                         server_match.file_path.display()
                     );
-                    self.mark_client_broken(key, err.to_string()).await;
+                    self.mark_client_broken_and_restart(key, err.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -338,7 +380,8 @@ impl SessionManager {
                     key.workspace_root.display(),
                     server_match.file_path.display()
                 );
-                self.mark_client_broken(key, err.to_string()).await;
+                self.mark_client_broken_and_restart(key, err.to_string())
+                    .await;
                 continue;
             }
             self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
@@ -362,7 +405,8 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display()
                     );
-                    self.mark_client_broken(key, err.to_string()).await;
+                    self.mark_client_broken_and_restart(key, err.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -451,7 +495,8 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display()
                     );
-                    self.mark_client_broken(key, err.to_string()).await;
+                    self.mark_client_broken_and_restart(key, err.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -578,7 +623,8 @@ impl SessionManager {
                     server_match.file_path.display(),
                     operation
                 );
-                self.mark_client_broken(key.clone(), err.to_string()).await;
+                self.mark_client_broken_and_restart(key.clone(), err.to_string())
+                    .await;
                 continue;
             }
             self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
@@ -603,7 +649,8 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display(),
                     );
-                    self.mark_client_broken(key.clone(), err.to_string()).await;
+                    self.mark_client_broken_and_restart(key.clone(), err.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -635,7 +682,8 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display(),
                     );
-                    self.mark_client_broken(key, err.to_string()).await;
+                    self.mark_client_broken_and_restart(key, err.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -701,7 +749,8 @@ impl SessionManager {
                     server_match.file_path.display(),
                     operation_name
                 );
-                self.mark_client_broken(key.clone(), err.to_string()).await;
+                self.mark_client_broken_and_restart(key.clone(), err.to_string())
+                    .await;
                 continue;
             }
             self.mark_client_success(&server_match.server.id, &server_match.workspace_root)
@@ -724,7 +773,8 @@ impl SessionManager {
                         key.server_id,
                         key.workspace_root.display(),
                     );
-                    self.mark_client_broken(key, err.to_string()).await;
+                    self.mark_client_broken_and_restart(key, err.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -750,6 +800,13 @@ impl SessionManager {
     ) -> Result<Arc<ClientHandle>> {
         let key = self.client_key(server_match);
         self.reconcile_client_health(&key).await;
+        if self.is_permanently_broken(&key).await {
+            return Err(anyhow!(
+                "LSP server {} is permanently broken for {}.",
+                key.server_id,
+                key.workspace_root.display(),
+            ));
+        }
         if let Some(retry_after_seconds) = self.retry_after_seconds(&key).await {
             return Err(anyhow!(
                 "LSP server {} is temporarily unavailable for {}. Retry later in {}s.",
@@ -767,6 +824,13 @@ impl SessionManager {
         let _guard = client_lock.lock().await;
 
         self.reconcile_client_health(&key).await;
+        if self.is_permanently_broken(&key).await {
+            return Err(anyhow!(
+                "LSP server {} is permanently broken for {}.",
+                key.server_id,
+                key.workspace_root.display(),
+            ));
+        }
         if let Some(retry_after_seconds) = self.retry_after_seconds(&key).await {
             return Err(anyhow!(
                 "LSP server {} is temporarily unavailable for {}. Retry later in {}s.",
@@ -783,7 +847,7 @@ impl SessionManager {
         self.mark_client_starting(&server_match.server.id, &server_match.workspace_root)
             .await;
 
-        let client = match ClientHandle::spawn(
+        let client = match (self.spawn_client)(
             server_match.server.clone(),
             key.workspace_root.clone(),
         )
@@ -796,7 +860,8 @@ impl SessionManager {
                     key.server_id,
                     key.workspace_root.display()
                 );
-                self.mark_client_broken(key.clone(), err.to_string()).await;
+                self.mark_client_broken_and_restart(key.clone(), err.to_string())
+                    .await;
                 return Err(err);
             }
         };
@@ -829,6 +894,13 @@ impl SessionManager {
         self.client_health.read().await.get(key).cloned()
     }
 
+    async fn is_permanently_broken(&self, key: &ClientKey) -> bool {
+        self.client_health(key)
+            .await
+            .map(|health| health.permanent_broken)
+            .unwrap_or(false)
+    }
+
     async fn client_lock(&self, key: &ClientKey) -> Arc<Mutex<()>> {
         let mut locks = self.client_locks.lock().await;
         locks
@@ -845,7 +917,7 @@ impl SessionManager {
             return;
         }
 
-        self.mark_client_broken(key.clone(), "LSP connection closed".to_string())
+        self.mark_client_broken_and_restart(key.clone(), "LSP connection closed".to_string())
             .await;
     }
 
@@ -872,9 +944,21 @@ impl SessionManager {
         entry.retry_at = None;
         entry.last_error = None;
         entry.last_success_at = Some(SystemTime::now());
+        entry.restart_in_progress = false;
+        entry.permanent_broken = false;
     }
 
+    #[cfg(test)]
     pub(crate) async fn mark_client_broken(&self, key: ClientKey, error: String) {
+        let tracked_documents = if let Some(client) = self.clients.read().await.get(&key).cloned() {
+            client.tracked_documents().await
+        } else {
+            self.client_health(&key)
+                .await
+                .map(|health| health.tracked_documents)
+                .unwrap_or_default()
+        };
+
         if let Some(client) = self.clients.write().await.remove(&key) {
             drop(client);
         }
@@ -885,6 +969,138 @@ impl SessionManager {
         entry.state = LspClientState::Broken;
         entry.last_error = Some(error);
         entry.retry_at = Some(Instant::now() + backoff_for_failure(entry.failure_count));
+        entry.tracked_documents = tracked_documents;
+    }
+
+    pub(crate) async fn mark_client_broken_and_restart(&self, key: ClientKey, error: String) {
+        let tracked_documents = if let Some(client) = self.clients.read().await.get(&key).cloned() {
+            client.tracked_documents().await
+        } else {
+            self.client_health(&key)
+                .await
+                .map(|health| health.tracked_documents)
+                .unwrap_or_default()
+        };
+
+        if let Some(client) = self.clients.write().await.remove(&key) {
+            drop(client);
+        }
+
+        let mut should_restart = false;
+        {
+            let mut health = self.client_health.write().await;
+            let entry = health.entry(key.clone()).or_default();
+            entry.state = LspClientState::Broken;
+            entry.last_error = Some(error);
+            entry.retry_at = None;
+            entry.tracked_documents = tracked_documents;
+            if !entry.permanent_broken && !entry.restart_in_progress {
+                entry.restart_in_progress = true;
+                should_restart = true;
+            }
+        }
+
+        if should_restart {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.restart_client(key).await;
+            });
+        }
+    }
+
+    async fn restart_client(&self, key: ClientKey) {
+        let Some(server) = self
+            .config
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .servers
+                    .iter()
+                    .find(|server| server.id == key.server_id)
+            })
+            .cloned()
+        else {
+            let mut health = self.client_health.write().await;
+            let entry = health.entry(key).or_default();
+            entry.state = LspClientState::Broken;
+            entry.last_error = Some("missing LSP server configuration".to_string());
+            entry.retry_at = None;
+            entry.restart_in_progress = false;
+            entry.permanent_broken = true;
+            return;
+        };
+
+        let client_lock = self.client_lock(&key).await;
+        let _guard = client_lock.lock().await;
+
+        if self.clients.read().await.contains_key(&key) {
+            let mut health = self.client_health.write().await;
+            let entry = health.entry(key).or_default();
+            entry.restart_in_progress = false;
+            return;
+        }
+
+        let tracked_documents = self
+            .client_health(&key)
+            .await
+            .map(|health| health.tracked_documents)
+            .unwrap_or_default();
+        let mut last_error = None;
+
+        for (attempt, delay) in self.restart_backoff.iter().copied().enumerate() {
+            {
+                let mut health = self.client_health.write().await;
+                let entry = health.entry(key.clone()).or_default();
+                entry.state = LspClientState::Starting;
+                entry.failure_count = attempt as u32 + 1;
+                entry.retry_at = Some(Instant::now() + delay);
+            }
+
+            tokio::time::sleep(delay).await;
+
+            let client = match (self.spawn_client)(server.clone(), key.workspace_root.clone()).await
+            {
+                Ok(client) => client,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    continue;
+                }
+            };
+
+            let reopen_result = async {
+                for file_path in &tracked_documents {
+                    client.open_or_change(file_path).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(err) = reopen_result {
+                last_error = Some(err.to_string());
+                drop(client);
+                continue;
+            }
+
+            self.clients.write().await.insert(key.clone(), client);
+            self.mark_client_success(&server.id, &key.workspace_root)
+                .await;
+            return;
+        }
+
+        warn!(
+            "LSP server {} in {} is permanently broken after {} restart attempts",
+            key.server_id,
+            key.workspace_root.display(),
+            self.restart_backoff.len()
+        );
+
+        let mut health = self.client_health.write().await;
+        let entry = health.entry(key).or_default();
+        entry.state = LspClientState::Broken;
+        entry.failure_count = self.restart_backoff.len() as u32;
+        entry.last_error = last_error;
+        entry.retry_at = None;
+        entry.restart_in_progress = false;
+        entry.permanent_broken = true;
     }
 
     pub(crate) async fn matching_server_matches(
@@ -965,6 +1181,10 @@ impl SessionManager {
 
 impl Drop for SessionManager {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.drop_guard) > 1 {
+            return;
+        }
+
         let clients = Arc::clone(&self.clients);
         let client_health = Arc::clone(&self.client_health);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1035,6 +1255,9 @@ pub(crate) struct ClientHealth {
     pub(crate) retry_at: Option<Instant>,
     pub(crate) last_error: Option<String>,
     pub(crate) last_success_at: Option<SystemTime>,
+    pub(crate) tracked_documents: Vec<PathBuf>,
+    pub(crate) restart_in_progress: bool,
+    pub(crate) permanent_broken: bool,
 }
 
 impl Default for ClientHealth {
@@ -1045,6 +1268,9 @@ impl Default for ClientHealth {
             retry_at: None,
             last_error: None,
             last_success_at: None,
+            tracked_documents: Vec::new(),
+            restart_in_progress: false,
+            permanent_broken: false,
         }
     }
 }
