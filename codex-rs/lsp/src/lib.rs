@@ -388,6 +388,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_root_detection_walks_up_and_caches_results() -> Result<()> {
+        let tmp = tempdir()?;
+        let workspace = tmp.path().join("workspace");
+        let project = workspace.join("project");
+        let nested = project.join("src/nested");
+        fs::create_dir_all(&nested).await?;
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").await?;
+        let file_path = nested.join("main.rs");
+        fs::write(&file_path, "fn main() {}\n").await?;
+
+        let manager = SessionManager::new(Some(LspConfig {
+            servers: vec![ServerConfig {
+                id: "rust".to_string(),
+                command: "true".to_string(),
+                args: Vec::new(),
+                extensions: vec![".rs".to_string()],
+                env: HashMap::new(),
+                initialization: None,
+                root_markers: vec!["Cargo.toml".to_string()],
+            }],
+        }));
+
+        let first_match = manager
+            .matching_server_matches(&file_path, &workspace)
+            .await
+            .into_iter()
+            .next()
+            .expect("first match");
+        assert_eq!(first_match.workspace_root, project);
+
+        fs::remove_file(first_match.workspace_root.join("Cargo.toml")).await?;
+
+        let cached_match = manager
+            .matching_server_matches(&file_path, &workspace)
+            .await
+            .into_iter()
+            .next()
+            .expect("cached match");
+        assert_eq!(cached_match.workspace_root, project);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn workspace_symbol_requires_active_client_or_file_scope() -> Result<()> {
         let tmp = tempdir()?;
         let manager = SessionManager::new(Some(LspConfig {
