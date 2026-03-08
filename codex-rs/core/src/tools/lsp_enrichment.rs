@@ -238,6 +238,7 @@ mod tests {
                 file_path.clone(),
                 vec![
                     LspDiagnostic {
+                        server: Some("fake".to_string()),
                         path: file_path.clone(),
                         range: codex_lsp::LspRange {
                             start: codex_lsp::LspPosition {
@@ -254,6 +255,7 @@ mod tests {
                         source: None,
                     },
                     LspDiagnostic {
+                        server: Some("fake".to_string()),
                         path: file_path.clone(),
                         range: codex_lsp::LspRange {
                             start: codex_lsp::LspPosition {
@@ -292,6 +294,7 @@ mod tests {
                 file_path.clone(),
                 vec![
                     LspDiagnostic {
+                        server: Some("fake".to_string()),
                         path: file_path.clone(),
                         range: codex_lsp::LspRange {
                             start: codex_lsp::LspPosition {
@@ -308,6 +311,7 @@ mod tests {
                         source: None,
                     },
                     LspDiagnostic {
+                        server: Some("fake".to_string()),
                         path: file_path.clone(),
                         range: codex_lsp::LspRange {
                             start: codex_lsp::LspPosition {
@@ -324,6 +328,7 @@ mod tests {
                         source: None,
                     },
                     LspDiagnostic {
+                        server: Some("fake".to_string()),
                         path: file_path,
                         range: codex_lsp::LspRange {
                             start: codex_lsp::LspPosition {
@@ -355,6 +360,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         for line in 1..=25 {
             diagnostics.push(LspDiagnostic {
+                server: Some("fake".to_string()),
                 path: file_path.clone(),
                 range: codex_lsp::LspRange {
                     start: codex_lsp::LspPosition { line, character: 1 },

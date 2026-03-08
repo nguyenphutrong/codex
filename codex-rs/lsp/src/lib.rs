@@ -12,9 +12,14 @@ pub use types::LspDiagnostic;
 pub use types::LspOperationResult;
 pub use types::LspPosition;
 pub use types::LspRange;
+pub use types::LspServerAvailability;
+pub use types::LspServerSource;
 pub use types::LspStatus;
 pub use types::PositionRequest;
+pub use types::ResolvedServerConfig;
 pub use types::ServerConfig;
+pub use types::ServerResolution;
+pub use types::UnavailableServer;
 
 #[cfg(test)]
 mod tests {
@@ -42,6 +47,16 @@ mod tests {
         SessionManager::with_options(
             config,
             |server, workspace_root| Box::pin(ClientHandle::spawn(server, workspace_root)),
+            |server, _workspace_root| {
+                Box::pin(async move {
+                    ServerResolution::Resolved(ResolvedServerConfig {
+                        command: server.command,
+                        args: server.args,
+                        env: server.env,
+                        source: LspServerSource::Global,
+                    })
+                })
+            },
             [
                 Duration::from_millis(10),
                 Duration::from_millis(20),
@@ -817,6 +832,16 @@ mod tests {
                     Ok(client)
                 })
             },
+            |server, _workspace_root| {
+                Box::pin(async move {
+                    ServerResolution::Resolved(ResolvedServerConfig {
+                        command: server.command,
+                        args: server.args,
+                        env: server.env,
+                        source: LspServerSource::Global,
+                    })
+                })
+            },
             [
                 Duration::from_millis(10),
                 Duration::from_millis(20),
@@ -1091,6 +1116,16 @@ mod tests {
                     client.initialize().await?;
 
                     Ok(client)
+                })
+            },
+            |server, _workspace_root| {
+                Box::pin(async move {
+                    ServerResolution::Resolved(ResolvedServerConfig {
+                        command: server.command,
+                        args: server.args,
+                        env: server.env,
+                        source: LspServerSource::Global,
+                    })
                 })
             },
             [

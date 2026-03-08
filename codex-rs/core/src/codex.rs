@@ -192,6 +192,7 @@ use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherEvent;
 use crate::git_info::get_git_repo_root;
 use crate::instructions::UserInstructions;
+use crate::lsp_runtime::build_lsp_session_manager;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::McpManager;
 use crate::mcp::auth::compute_auth_statuses;
@@ -294,9 +295,6 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::util::backoff;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_async_utils::OrCancelExt;
-use codex_lsp::LspConfig as RuntimeLspConfig;
-use codex_lsp::ServerConfig as RuntimeLspServerConfig;
-use codex_lsp::SessionManager as LspSessionManager;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
@@ -1501,23 +1499,7 @@ impl Session {
             } else {
                 (None, None)
             };
-        let lsp_manager = config.lsp.as_ref().map(|lsp| {
-            Arc::new(LspSessionManager::new(Some(RuntimeLspConfig {
-                servers: lsp
-                    .servers
-                    .iter()
-                    .map(|server| RuntimeLspServerConfig {
-                        id: server.id.clone(),
-                        command: server.command.clone(),
-                        args: server.args.clone(),
-                        extensions: server.extensions.clone(),
-                        env: server.env.clone(),
-                        initialization: server.initialization.clone(),
-                        root_markers: server.root_markers.clone(),
-                    })
-                    .collect(),
-            })))
-        });
+        let lsp_manager = build_lsp_session_manager(&config);
 
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized

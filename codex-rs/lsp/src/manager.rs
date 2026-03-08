@@ -9,9 +9,14 @@ use crate::types::LspClientState;
 use crate::types::LspConfig;
 use crate::types::LspDiagnostic;
 use crate::types::LspOperationResult;
+use crate::types::LspServerAvailability;
+use crate::types::LspServerSource;
 use crate::types::LspStatus;
 use crate::types::PositionRequest;
+use crate::types::ResolvedServerConfig;
 use crate::types::ServerConfig;
+use crate::types::ServerResolution;
+use crate::types::UnavailableServer;
 #[cfg(test)]
 use crate::util::backoff_for_failure;
 use crate::util::path_to_uri;
@@ -40,6 +45,8 @@ use tracing::warn;
 
 type SpawnClientFuture = Pin<Box<dyn Future<Output = Result<Arc<ClientHandle>>> + Send + 'static>>;
 type SpawnClientFn = dyn Fn(ServerConfig, PathBuf) -> SpawnClientFuture + Send + Sync;
+type ResolveServerFuture = Pin<Box<dyn Future<Output = ServerResolution> + Send + 'static>>;
+type ResolveServerFn = dyn Fn(ServerConfig, PathBuf) -> ResolveServerFuture + Send + Sync;
 
 const CLIENT_RESTART_BACKOFF: [Duration; 3] = [
     Duration::from_secs(1),
@@ -56,6 +63,7 @@ pub struct SessionManager {
     workspace_root_cache: Arc<RwLock<HashMap<WorkspaceRootCacheKey, PathBuf>>>,
     drop_guard: Arc<()>,
     spawn_client: Arc<SpawnClientFn>,
+    resolve_server: Arc<ResolveServerFn>,
     restart_backoff: [Duration; 3],
 }
 
@@ -71,18 +79,47 @@ impl SessionManager {
             spawn_client: Arc::new(|server, workspace_root| {
                 Box::pin(ClientHandle::spawn(server, workspace_root))
             }),
+            resolve_server: Arc::new(|server, _workspace_root| {
+                Box::pin(async move {
+                    match resolve_command(&server.command) {
+                        Ok(command) => ServerResolution::Resolved(ResolvedServerConfig {
+                            command: command.to_string_lossy().into_owned(),
+                            args: server.args,
+                            env: server.env,
+                            source: LspServerSource::Global,
+                        }),
+                        Err(err) => ServerResolution::Unavailable(UnavailableServer {
+                            availability: LspServerAvailability::Unavailable,
+                            reason: err.to_string(),
+                            requirements: None,
+                            source: None,
+                        }),
+                    }
+                })
+            }),
             restart_backoff: CLIENT_RESTART_BACKOFF,
         }
     }
 
+    pub fn with_resolver<F>(config: Option<LspConfig>, resolver: F) -> Self
+    where
+        F: Fn(ServerConfig, PathBuf) -> ResolveServerFuture + Send + Sync + 'static,
+    {
+        let mut manager = Self::new(config);
+        manager.resolve_server = Arc::new(resolver);
+        manager
+    }
+
     #[cfg(test)]
-    pub(crate) fn with_options<F>(
+    pub(crate) fn with_options<F, R>(
         config: Option<LspConfig>,
         spawn_client: F,
+        resolver: R,
         restart_backoff: [Duration; 3],
     ) -> Self
     where
         F: Fn(ServerConfig, PathBuf) -> SpawnClientFuture + Send + Sync + 'static,
+        R: Fn(ServerConfig, PathBuf) -> ResolveServerFuture + Send + Sync + 'static,
     {
         Self {
             config: config.map(Arc::new),
@@ -92,6 +129,7 @@ impl SessionManager {
             workspace_root_cache: Arc::new(RwLock::new(HashMap::new())),
             drop_guard: Arc::new(()),
             spawn_client: Arc::new(spawn_client),
+            resolve_server: Arc::new(resolver),
             restart_backoff,
         }
     }
@@ -170,6 +208,13 @@ impl SessionManager {
                 if diagnostics.is_empty() {
                     continue;
                 }
+                let diagnostics = diagnostics
+                    .into_iter()
+                    .map(|diagnostic| LspDiagnostic {
+                        server: Some(server_match.server.id.clone()),
+                        ..diagnostic
+                    })
+                    .collect::<Vec<_>>();
 
                 aggregated
                     .entry(server_match.file_path.clone())
@@ -217,18 +262,40 @@ impl SessionManager {
         for server_match in matches {
             let key = self.client_key(&server_match);
             self.reconcile_client_health(&key).await;
+            let resolution = self.resolve_server_for_match(&server_match).await;
             let health = self.client_health(&key).await.unwrap_or_default();
             let retry_after_seconds = health.retry_at.and_then(|retry_at| {
                 retry_at
                     .checked_duration_since(Instant::now())
                     .map(|duration| duration.as_secs())
             });
+            let (availability, source, last_error, requirements, resolved_command) =
+                match resolution {
+                    ServerResolution::Resolved(resolved) => (
+                        LspServerAvailability::Ready,
+                        Some(resolved.source),
+                        health.last_error.clone(),
+                        None,
+                        Some(resolved.command),
+                    ),
+                    ServerResolution::Unavailable(unavailable) => (
+                        unavailable.availability,
+                        unavailable.source,
+                        Some(unavailable.reason),
+                        unavailable.requirements,
+                        None,
+                    ),
+                };
             statuses.push(LspStatus {
                 server: server_match.server.id.clone(),
                 workspace_root: server_match.workspace_root,
                 state: health.state,
+                availability,
+                source,
                 retry_after_seconds,
-                last_error: health.last_error,
+                last_error,
+                requirements,
+                resolved_command,
             });
         }
 
@@ -890,9 +957,20 @@ impl SessionManager {
 
         self.mark_client_starting(&server_match.server.id, &server_match.workspace_root)
             .await;
+        let resolved_server = match self.resolve_server_for_match(server_match).await {
+            ServerResolution::Resolved(resolved) => resolved,
+            ServerResolution::Unavailable(unavailable) => {
+                return Err(anyhow!(unavailable.reason));
+            }
+        };
 
         let client = match (self.spawn_client)(
-            server_match.server.clone(),
+            ServerConfig {
+                command: resolved_server.command,
+                args: resolved_server.args,
+                env: resolved_server.env,
+                ..server_match.server.clone()
+            },
             key.workspace_root.clone(),
         )
         .await
@@ -1188,10 +1266,6 @@ impl SessionManager {
             {
                 continue;
             }
-            if resolve_command(&server.command).is_err() {
-                continue;
-            }
-
             matches.push(ServerMatch {
                 file_path: file_path.clone(),
                 workspace_root: self
@@ -1268,6 +1342,14 @@ impl SessionManager {
             .await
             .insert(key, workspace_root.clone());
         workspace_root
+    }
+
+    async fn resolve_server_for_match(&self, server_match: &ServerMatch) -> ServerResolution {
+        (self.resolve_server)(
+            server_match.server.clone(),
+            server_match.workspace_root.clone(),
+        )
+        .await
     }
 }
 

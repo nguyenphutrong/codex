@@ -24,9 +24,22 @@ lsp = true
 
 [lsp]
 enabled = true
+mode = "auto"
 ```
 
-When enabled, Codex starts matching language servers on demand. A built-in server is only used when its command is already installed locally.
+When enabled, Codex starts matching language servers on demand. Depending on the built-in server, Codex resolves a workspace-provided binary, a global binary, or a managed cached install under `CODEX_HOME/packages/lsp`.
+
+You can also override the mode per invocation:
+
+```bash
+codex --lsp=auto
+codex --lsp=on
+codex --lsp=off
+```
+
+- `auto`: detect, resolve, and auto-install supported built-ins when needed
+- `on`: same as `auto`, but intended for explicitly LSP-enabled runs
+- `off`: disable LSP resolution, startup, and diagnostics feedback for that invocation
 
 ## Built-in servers
 
@@ -67,6 +80,21 @@ The current catalog contains 32 built-in server definitions:
 | `yaml-ls` | `yaml-language-server` | `.yaml`, `.yml` |
 | `zls` | `zls` | `.zig`, `.zon` |
 
+## CLI inspection
+
+Inspect detected servers and their resolution source:
+
+```bash
+codex lsp status
+```
+
+Inspect diagnostics for the active workspace or a specific file:
+
+```bash
+codex lsp diagnostics
+codex lsp diagnostics --file src/main.rs
+```
+
 ## Override a built-in server
 
 Override only the fields you need. Any omitted field falls back to the built-in definition.
@@ -89,6 +117,10 @@ Each server entry supports:
 - `env`
 - `initialization`
 - `root_markers`
+- `runtime_kind`
+- `project_local_candidates`
+- `requirements`
+- `managed_npm`
 
 `root_markers` are walked upward from the file directory until Codex reaches the current workspace directory or the filesystem root.
 
@@ -102,6 +134,7 @@ command = "mydsl-lsp"
 args = ["--stdio"]
 extensions = [".dsl", ".dsli"]
 root_markers = [".git", "mydsl.toml"]
+runtime_kind = "user_configured"
 initialization = { telemetry = { enabled = false } }
 ```
 
@@ -129,6 +162,7 @@ lsp = true
 
 [lsp]
 enabled = true
+mode = "auto"
 
 [lsp.servers.rust]
 root_markers = ["Cargo.toml", "rust-project.json", ".git"]
@@ -144,6 +178,7 @@ command = "mydsl-lsp"
 args = ["--stdio"]
 extensions = [".dsl"]
 root_markers = [".git", "mydsl.toml"]
+runtime_kind = "user_configured"
 ```
 
 ## Troubleshooting
@@ -151,16 +186,24 @@ root_markers = [".git", "mydsl.toml"]
 Server does not start:
 
 - Confirm `[features].lsp = true` and `[lsp].enabled = true`.
-- Make sure the configured `command` is installed and on `PATH`.
+- Check `codex lsp status` to see whether Codex picked a workspace, global, or managed runtime.
+- Make sure the configured `command` is installed and on `PATH` when the server is not managed.
 - Check that the file extension matches the server entry.
 - Check that the workspace contains at least one expected `root_markers` file when the server depends on project roots.
 
 Diagnostics do not appear:
 
-- Codex only queries servers whose commands are available locally.
+- Codex only queries servers it could resolve successfully for the workspace.
 - Diagnostics are best-effort and only shown for files touched during the turn.
 - `didSave` is only sent for documents Codex has already opened with that LSP client.
 - If a server advertises no diagnostics support, Codex can still use other LSP features but will not expect publish-diagnostics traffic from it.
+- `codex lsp diagnostics` will touch matching files in the workspace to refresh diagnostics before printing them.
+
+Managed installs:
+
+- Managed npm-backed servers are cached under `CODEX_HOME/packages/lsp/npm/<server>/<version>`.
+- If a workspace-provided binary exists, Codex prefers it over the managed cache.
+- If no workspace binary exists, Codex prefers a warm managed cache entry over a global binary, then falls back to auto-install.
 
 PHP + `intelephense`:
 

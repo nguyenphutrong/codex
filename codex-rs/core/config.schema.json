@@ -640,6 +640,24 @@
         }
       ]
     },
+    "LspMode": {
+      "enum": [
+        "off",
+        "auto",
+        "on"
+      ],
+      "type": "string"
+    },
+    "LspRuntimeKind": {
+      "enum": [
+        "toolchain_provided",
+        "project_dependency",
+        "managed_npm",
+        "managed_github_release",
+        "user_configured"
+      ],
+      "type": "string"
+    },
     "LspServerToml": {
       "additionalProperties": false,
       "properties": {
@@ -668,11 +686,26 @@
           "type": "array"
         },
         "initialization": true,
+        "managed_npm": {
+          "$ref": "#/definitions/ManagedNpmLspServerToml"
+        },
+        "project_local_candidates": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requirements": {
+          "type": "string"
+        },
         "root_markers": {
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "runtime_kind": {
+          "$ref": "#/definitions/LspRuntimeKind"
         }
       },
       "type": "object"
@@ -680,8 +713,14 @@
     "LspToml": {
       "additionalProperties": false,
       "properties": {
+        "assume_yes": {
+          "type": "boolean"
+        },
         "enabled": {
           "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/definitions/LspMode"
         },
         "servers": {
           "additionalProperties": {
@@ -691,6 +730,26 @@
           "type": "object"
         }
       },
+      "type": "object"
+    },
+    "ManagedNpmLspServerToml": {
+      "additionalProperties": false,
+      "properties": {
+        "bin": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bin",
+        "package",
+        "version"
+      ],
       "type": "object"
     },
     "MemoriesToml": {

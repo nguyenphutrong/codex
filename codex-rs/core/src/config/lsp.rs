@@ -1,8 +1,11 @@
 use crate::config::ConfigToml;
 use crate::config::ManagedFeatures;
 use crate::config::types::LspConfig;
+use crate::config::types::LspMode;
+use crate::config::types::LspRuntimeKind;
 use crate::config::types::LspServerConfig;
 use crate::config::types::LspServerToml;
+use crate::config::types::ManagedNpmLspServerConfig;
 use crate::features::Feature;
 use serde_json::json;
 use std::collections::HashMap;
@@ -37,8 +40,12 @@ pub(super) fn resolve_lsp_config(
     }
 
     let mut servers = servers.into_values().collect::<Vec<_>>();
-    servers.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(Some(LspConfig { servers }))
+    servers.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(Some(LspConfig {
+        mode: lsp.mode.unwrap_or(LspMode::Auto),
+        assume_yes: lsp.assume_yes.unwrap_or(false),
+        servers,
+    }))
 }
 
 fn merge_server(existing: LspServerConfig, override_server: LspServerToml) -> LspServerConfig {
@@ -52,6 +59,17 @@ fn merge_server(existing: LspServerConfig, override_server: LspServerToml) -> Ls
         root_markers: override_server
             .root_markers
             .unwrap_or(existing.root_markers),
+        runtime_kind: override_server
+            .runtime_kind
+            .unwrap_or(existing.runtime_kind),
+        project_local_candidates: override_server
+            .project_local_candidates
+            .unwrap_or(existing.project_local_candidates),
+        requirements: override_server.requirements.or(existing.requirements),
+        managed_npm: override_server
+            .managed_npm
+            .map(managed_npm)
+            .or(existing.managed_npm),
     }
 }
 
@@ -68,7 +86,6 @@ fn custom_server(id: String, server: LspServerToml) -> io::Result<LspServerConfi
             format!("custom LSP server `{id}` requires `extensions`"),
         )
     })?;
-
     if extensions.is_empty() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -84,602 +101,476 @@ fn custom_server(id: String, server: LspServerToml) -> io::Result<LspServerConfi
         env: server.env.unwrap_or_default(),
         initialization: server.initialization,
         root_markers: server.root_markers.unwrap_or_default(),
+        runtime_kind: server
+            .runtime_kind
+            .unwrap_or(LspRuntimeKind::UserConfigured),
+        project_local_candidates: server.project_local_candidates.unwrap_or_default(),
+        requirements: server.requirements,
+        managed_npm: server.managed_npm.map(managed_npm),
     })
+}
+
+fn managed_npm(server: crate::config::types::ManagedNpmLspServerToml) -> ManagedNpmLspServerConfig {
+    ManagedNpmLspServerConfig {
+        package: server.package,
+        version: server.version,
+        bin: server.bin,
+    }
 }
 
 fn built_in_servers() -> HashMap<String, LspServerConfig> {
     [
-        (
+        managed_npm_server(
             "astro",
-            LspServerConfig {
-                id: "astro".to_string(),
-                command: "astro-ls".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".astro"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "package.json",
-                    "package-lock.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "astro-ls",
+            vec!["--stdio"],
+            vec![".astro"],
+            package_roots(),
+            "@astrojs/language-server",
+            "2.16.3",
+            "astro-ls",
+            vec!["node_modules/.bin/astro-ls"],
+            "Auto-installs the managed Astro language server when needed.",
         ),
-        (
+        managed_npm_server(
             "bash",
-            LspServerConfig {
-                id: "bash".to_string(),
-                command: "bash-language-server".to_string(),
-                args: vec!["start".to_string()],
-                extensions: [".sh", ".bash", ".zsh", ".ksh"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: Vec::new(),
-            },
+            "bash-language-server",
+            vec!["start"],
+            vec![".sh", ".bash", ".zsh", ".ksh"],
+            Vec::new(),
+            "bash-language-server",
+            "5.6.0",
+            "bash-language-server",
+            vec!["node_modules/.bin/bash-language-server"],
+            "Auto-installs the managed bash-language-server when needed.",
         ),
-        (
+        toolchain_server(
             "clangd",
-            LspServerConfig {
-                id: "clangd".to_string(),
-                command: "clangd".to_string(),
-                args: vec!["--background-index".to_string(), "--clang-tidy".to_string()],
-                extensions: [
-                    ".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++", ".m",
-                    ".mm",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "compile_commands.json",
-                    "compile_flags.txt",
-                    ".clangd",
-                    "CMakeLists.txt",
-                    "Makefile",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "clangd",
+            vec!["--background-index", "--clang-tidy"],
+            vec![
+                ".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++", ".m",
+                ".mm",
+            ],
+            vec![
+                "compile_commands.json",
+                "compile_flags.txt",
+                ".clangd",
+                "CMakeLists.txt",
+                "Makefile",
+            ],
+            "Requires `clangd` from the local LLVM/Clang toolchain.",
         ),
-        (
+        toolchain_server(
             "clojure-lsp",
-            LspServerConfig {
-                id: "clojure-lsp".to_string(),
-                command: "clojure-lsp".to_string(),
-                args: vec!["listen".to_string()],
-                extensions: [".clj", ".cljs", ".cljc", ".edn"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "deps.edn",
-                    "project.clj",
-                    "shadow-cljs.edn",
-                    "bb.edn",
-                    "build.boot",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "clojure-lsp",
+            vec!["listen"],
+            vec![".clj", ".cljs", ".cljc", ".edn"],
+            vec!["deps.edn", "project.clj", "shadow-cljs.edn", "bb.edn", "build.boot"],
+            "Requires `clojure-lsp` installed locally.",
         ),
-        (
+        toolchain_server(
             "csharp",
-            LspServerConfig {
-                id: "csharp".to_string(),
-                command: "csharp-ls".to_string(),
-                args: Vec::new(),
-                extensions: [".cs"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [".slnx", ".sln", ".csproj", "global.json"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "csharp-ls",
+            Vec::<&str>::new(),
+            vec![".cs"],
+            vec![".slnx", ".sln", ".csproj", "global.json"],
+            "Requires .NET SDK and `csharp-ls` installed locally.",
         ),
-        (
+        toolchain_server(
             "dart",
-            LspServerConfig {
-                id: "dart".to_string(),
-                command: "dart".to_string(),
-                args: vec!["language-server".to_string(), "--lsp".to_string()],
-                extensions: [".dart"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["pubspec.yaml", "analysis_options.yaml"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "dart",
+            vec!["language-server", "--lsp"],
+            vec![".dart"],
+            vec!["pubspec.yaml", "analysis_options.yaml"],
+            "Requires the `dart` command from a local Dart/Flutter toolchain.",
         ),
-        (
+        toolchain_server(
             "deno",
-            LspServerConfig {
-                id: "deno".to_string(),
-                command: "deno".to_string(),
-                args: vec!["lsp".to_string()],
-                extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["deno.json", "deno.jsonc"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "deno",
+            vec!["lsp"],
+            vec![".ts", ".tsx", ".js", ".jsx", ".mjs"],
+            vec!["deno.json", "deno.jsonc"],
+            "Requires the `deno` command and a Deno workspace.",
         ),
-        (
+        toolchain_server(
             "elixir-ls",
-            LspServerConfig {
-                id: "elixir-ls".to_string(),
-                command: "elixir-ls".to_string(),
-                args: Vec::new(),
-                extensions: [".ex", ".exs"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["mix.exs", "mix.lock"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "elixir-ls",
+            Vec::<&str>::new(),
+            vec![".ex", ".exs"],
+            vec!["mix.exs", "mix.lock"],
+            "Requires Elixir tooling and `elixir-ls` installed locally.",
         ),
-        (
+        project_server(
             "eslint",
-            LspServerConfig {
-                id: "eslint".to_string(),
-                command: "vscode-eslint-language-server".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [
-                    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "package.json",
-                    "package-lock.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "vscode-eslint-language-server",
+            vec!["--stdio"],
+            vec![".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue"],
+            package_roots(),
+            vec!["node_modules/.bin/vscode-eslint-language-server"],
+            "Requires an ESLint language server binary in the workspace or on PATH.",
         ),
-        (
+        toolchain_server(
             "fsharp",
-            LspServerConfig {
-                id: "fsharp".to_string(),
-                command: "fsautocomplete".to_string(),
-                args: Vec::new(),
-                extensions: [".fs", ".fsi", ".fsx", ".fsscript"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [".slnx", ".sln", ".fsproj", "global.json"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "fsautocomplete",
+            Vec::<&str>::new(),
+            vec![".fs", ".fsi", ".fsx", ".fsscript"],
+            vec![".slnx", ".sln", ".fsproj", "global.json"],
+            "Requires .NET SDK and `fsautocomplete` installed locally.",
         ),
-        (
+        toolchain_server(
             "gleam",
-            LspServerConfig {
-                id: "gleam".to_string(),
-                command: "gleam".to_string(),
-                args: vec!["lsp".to_string()],
-                extensions: [".gleam"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["gleam.toml"].into_iter().map(str::to_string).collect(),
-            },
+            "gleam",
+            vec!["lsp"],
+            vec![".gleam"],
+            vec!["gleam.toml"],
+            "Requires the `gleam` toolchain installed locally.",
         ),
-        (
+        toolchain_server(
             "gopls",
-            LspServerConfig {
-                id: "gopls".to_string(),
-                command: "gopls".to_string(),
-                args: Vec::new(),
-                extensions: [".go"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["go.mod", "go.work", "go.sum"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "gopls",
+            Vec::<&str>::new(),
+            vec![".go"],
+            vec!["go.mod", "go.work", "go.sum"],
+            "Requires the `go` toolchain and `gopls` installed locally.",
         ),
-        (
+        toolchain_server(
             "hls",
-            LspServerConfig {
-                id: "hls".to_string(),
-                command: "haskell-language-server-wrapper".to_string(),
-                args: vec!["--lsp".to_string()],
-                extensions: [".hs", ".lhs"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["stack.yaml", "cabal.project", "hie.yaml"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "haskell-language-server-wrapper",
+            vec!["--lsp"],
+            vec![".hs", ".lhs"],
+            vec!["stack.yaml", "cabal.project", "hie.yaml"],
+            "Requires `haskell-language-server-wrapper` installed locally.",
         ),
-        (
+        managed_npm_server(
             "intelephense",
-            LspServerConfig {
-                id: "intelephense".to_string(),
-                command: "intelephense".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".php"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: Some(json!({
-                    "telemetry": {
-                        "enabled": false,
-                    },
-                })),
-                root_markers: ["composer.json", "composer.lock", ".php-version", ".git"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+            "intelephense",
+            vec!["--stdio"],
+            vec![".php"],
+            vec!["composer.json", "composer.lock", ".php-version", ".git"],
+            "intelephense",
+            "1.16.5",
+            "intelephense",
+            vec!["node_modules/.bin/intelephense"],
+            "Auto-installs the managed Intelephense package when needed.",
+        )
+        .with_initialization(json!({
+            "telemetry": {
+                "enabled": false,
             },
-        ),
-        (
+        })),
+        toolchain_server(
             "jdtls",
-            LspServerConfig {
-                id: "jdtls".to_string(),
-                command: "jdtls".to_string(),
-                args: Vec::new(),
-                extensions: [".java"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "pom.xml",
-                    "build.gradle",
-                    "build.gradle.kts",
-                    ".project",
-                    ".classpath",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "jdtls",
+            Vec::<&str>::new(),
+            vec![".java"],
+            vec!["pom.xml", "build.gradle", "build.gradle.kts", ".project", ".classpath"],
+            "Requires Java SDK and `jdtls` installed locally.",
         ),
-        (
+        toolchain_server(
             "julials",
-            LspServerConfig {
-                id: "julials".to_string(),
-                command: "julia".to_string(),
-                args: vec![
-                    "--startup-file=no".to_string(),
-                    "--history-file=no".to_string(),
-                    "-e".to_string(),
-                    "using LanguageServer; runserver()".to_string(),
-                ],
-                extensions: [".jl"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["Project.toml", "Manifest.toml"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "julia",
+            vec![
+                "--startup-file=no",
+                "--history-file=no",
+                "-e",
+                "using LanguageServer; runserver()",
+            ],
+            vec![".jl"],
+            vec!["Project.toml", "Manifest.toml"],
+            "Requires the `julia` toolchain installed locally.",
         ),
-        (
+        toolchain_server(
             "kotlin-ls",
-            LspServerConfig {
-                id: "kotlin-ls".to_string(),
-                command: "kotlin-lsp".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".kt", ".kts"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "settings.gradle.kts",
-                    "settings.gradle",
-                    "build.gradle.kts",
-                    "build.gradle",
-                    "pom.xml",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "kotlin-lsp",
+            vec!["--stdio"],
+            vec![".kt", ".kts"],
+            vec![
+                "settings.gradle.kts",
+                "settings.gradle",
+                "build.gradle.kts",
+                "build.gradle",
+                "pom.xml",
+            ],
+            "Requires `kotlin-lsp` installed locally.",
         ),
-        (
+        toolchain_server(
             "lua-ls",
-            LspServerConfig {
-                id: "lua-ls".to_string(),
-                command: "lua-language-server".to_string(),
-                args: Vec::new(),
-                extensions: [".lua"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    ".luarc.json",
-                    ".luarc.jsonc",
-                    ".luacheckrc",
-                    ".stylua.toml",
-                    "stylua.toml",
-                    "selene.toml",
-                    "selene.yml",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "lua-language-server",
+            Vec::<&str>::new(),
+            vec![".lua"],
+            vec![
+                ".luarc.json",
+                ".luarc.jsonc",
+                ".luacheckrc",
+                ".stylua.toml",
+                "stylua.toml",
+                "selene.toml",
+                "selene.yml",
+            ],
+            "Requires `lua-language-server` installed locally.",
         ),
-        (
+        toolchain_server(
             "nixd",
-            LspServerConfig {
-                id: "nixd".to_string(),
-                command: "nixd".to_string(),
-                args: Vec::new(),
-                extensions: [".nix"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["flake.nix", "default.nix", "shell.nix"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "nixd",
+            Vec::<&str>::new(),
+            vec![".nix"],
+            vec!["flake.nix", "default.nix", "shell.nix"],
+            "Requires `nixd` installed locally.",
         ),
-        (
+        toolchain_server(
             "ocaml-lsp",
-            LspServerConfig {
-                id: "ocaml-lsp".to_string(),
-                command: "ocamllsp".to_string(),
-                args: Vec::new(),
-                extensions: [".ml", ".mli"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["dune-project", "dune-workspace", ".merlin", "opam"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "ocamllsp",
+            Vec::<&str>::new(),
+            vec![".ml", ".mli"],
+            vec!["dune-project", "dune-workspace", ".merlin", "opam"],
+            "Requires `ocamllsp` installed locally.",
         ),
-        (
+        toolchain_server(
             "prisma",
-            LspServerConfig {
-                id: "prisma".to_string(),
-                command: "prisma".to_string(),
-                args: vec!["language-server".to_string()],
-                extensions: [".prisma"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["schema.prisma"].into_iter().map(str::to_string).collect(),
-            },
+            "prisma",
+            vec!["language-server"],
+            vec![".prisma"],
+            vec!["schema.prisma"],
+            "Requires the `prisma` CLI installed locally.",
         ),
-        (
+        managed_npm_server(
             "pyright",
-            LspServerConfig {
-                id: "pyright".to_string(),
-                command: "pyright-langserver".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".py", ".pyi"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "pyproject.toml",
-                    "setup.py",
-                    "setup.cfg",
-                    "requirements.txt",
-                    "Pipfile",
-                    "pyrightconfig.json",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "pyright-langserver",
+            vec!["--stdio"],
+            vec![".py", ".pyi"],
+            vec![
+                "pyproject.toml",
+                "setup.py",
+                "setup.cfg",
+                "requirements.txt",
+                "Pipfile",
+                "pyrightconfig.json",
+            ],
+            "pyright",
+            "1.1.408",
+            "pyright-langserver",
+            vec!["node_modules/.bin/pyright-langserver"],
+            "Uses workspace `pyright` when present, otherwise installs a managed copy.",
         ),
-        (
+        toolchain_server(
             "ruby-lsp",
-            LspServerConfig {
-                id: "ruby-lsp".to_string(),
-                command: "rubocop".to_string(),
-                args: vec!["--lsp".to_string()],
-                extensions: [".rb", ".rake", ".gemspec", ".ru"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["Gemfile"].into_iter().map(str::to_string).collect(),
-            },
+            "rubocop",
+            vec!["--lsp"],
+            vec![".rb", ".rake", ".gemspec", ".ru"],
+            vec!["Gemfile"],
+            "Requires Ruby tooling and `rubocop --lsp` support locally.",
         ),
-        (
+        toolchain_server(
             "rust",
-            LspServerConfig {
-                id: "rust".to_string(),
-                command: "rust-analyzer".to_string(),
-                args: Vec::new(),
-                extensions: [".rs"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["Cargo.toml", "rust-project.json"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "rust-analyzer",
+            Vec::<&str>::new(),
+            vec![".rs"],
+            vec!["Cargo.toml", "rust-project.json"],
+            "Requires `rust-analyzer` installed locally.",
         ),
-        (
+        toolchain_server(
             "sourcekit",
-            LspServerConfig {
-                id: "sourcekit".to_string(),
-                command: "sourcekit-lsp".to_string(),
-                args: Vec::new(),
-                extensions: [".swift", ".m", ".mm", ".objc", ".objcpp"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["Package.swift", ".xcodeproj", ".xcworkspace"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            },
+            "sourcekit-lsp",
+            Vec::<&str>::new(),
+            vec![".swift", ".m", ".mm", ".objc", ".objcpp"],
+            vec!["Package.swift", ".xcodeproj", ".xcworkspace"],
+            "Requires the local Swift/Xcode toolchain with `sourcekit-lsp`.",
         ),
-        (
+        managed_npm_server(
             "svelte",
-            LspServerConfig {
-                id: "svelte".to_string(),
-                command: "svelteserver".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".svelte"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "package.json",
-                    "package-lock.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "svelteserver",
+            vec!["--stdio"],
+            vec![".svelte"],
+            package_roots(),
+            "svelte-language-server",
+            "0.17.29",
+            "svelteserver",
+            vec!["node_modules/.bin/svelteserver"],
+            "Auto-installs the managed Svelte language server when needed.",
         ),
-        (
+        toolchain_server(
             "terraform",
-            LspServerConfig {
-                id: "terraform".to_string(),
-                command: "terraform-ls".to_string(),
-                args: vec!["serve".to_string()],
-                extensions: [".tf", ".tfvars"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: Some(json!({
-                    "experimentalFeatures": {
-                        "prefillRequiredFields": true,
-                        "validateOnSave": true,
-                    },
-                })),
-                root_markers: [".terraform.lock.hcl", "terraform.tfstate"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+            "terraform-ls",
+            vec!["serve"],
+            vec![".tf", ".tfvars"],
+            vec![".terraform.lock.hcl", "terraform.tfstate"],
+            "Requires `terraform-ls` installed locally.",
+        )
+        .with_initialization(json!({
+            "experimentalFeatures": {
+                "prefillRequiredFields": true,
+                "validateOnSave": true,
             },
-        ),
-        (
+        })),
+        toolchain_server(
             "tinymist",
-            LspServerConfig {
-                id: "tinymist".to_string(),
-                command: "tinymist".to_string(),
-                args: Vec::new(),
-                extensions: [".typ", ".typc"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["typst.toml"].into_iter().map(str::to_string).collect(),
-            },
+            "tinymist",
+            Vec::<&str>::new(),
+            vec![".typ", ".typc"],
+            vec!["typst.toml"],
+            "Requires `tinymist` installed locally.",
         ),
-        (
+        managed_npm_server(
             "typescript",
-            LspServerConfig {
-                id: "typescript".to_string(),
-                command: "typescript-language-server".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "package.json",
-                    "package-lock.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "typescript-language-server",
+            vec!["--stdio"],
+            vec![".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"],
+            package_roots(),
+            "typescript-language-server",
+            "5.1.3",
+            "typescript-language-server",
+            vec!["node_modules/.bin/typescript-language-server"],
+            "Uses workspace `typescript-language-server` when present, otherwise installs a managed copy.",
         ),
-        (
+        managed_npm_server(
             "vue",
-            LspServerConfig {
-                id: "vue".to_string(),
-                command: "vue-language-server".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".vue"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: [
-                    "package.json",
-                    "package-lock.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            },
+            "vue-language-server",
+            vec!["--stdio"],
+            vec![".vue"],
+            package_roots(),
+            "@vue/language-server",
+            "3.2.5",
+            "vue-language-server",
+            vec!["node_modules/.bin/vue-language-server"],
+            "Auto-installs the managed Vue language server when needed.",
         ),
-        (
+        managed_npm_server(
             "yaml-ls",
-            LspServerConfig {
-                id: "yaml-ls".to_string(),
-                command: "yaml-language-server".to_string(),
-                args: vec!["--stdio".to_string()],
-                extensions: [".yaml", ".yml"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: Vec::new(),
-            },
+            "yaml-language-server",
+            vec!["--stdio"],
+            vec![".yaml", ".yml"],
+            Vec::<&str>::new(),
+            "yaml-language-server",
+            "1.21.0",
+            "yaml-language-server",
+            vec!["node_modules/.bin/yaml-language-server"],
+            "Auto-installs the managed YAML language server when needed.",
         ),
-        (
+        toolchain_server(
             "zls",
-            LspServerConfig {
-                id: "zls".to_string(),
-                command: "zls".to_string(),
-                args: Vec::new(),
-                extensions: [".zig", ".zon"].into_iter().map(str::to_string).collect(),
-                env: HashMap::new(),
-                initialization: None,
-                root_markers: ["build.zig"].into_iter().map(str::to_string).collect(),
-            },
+            "zls",
+            Vec::<&str>::new(),
+            vec![".zig", ".zon"],
+            vec!["build.zig"],
+            "Requires `zls` installed locally.",
         ),
     ]
     .into_iter()
-    .map(|(id, server)| (id.to_string(), server))
+    .map(|server| (server.id.clone(), server))
     .collect()
+}
+
+fn toolchain_server(
+    id: &str,
+    command: &str,
+    args: Vec<&str>,
+    extensions: Vec<&str>,
+    root_markers: Vec<&str>,
+    requirements: &str,
+) -> LspServerConfig {
+    LspServerConfig {
+        id: id.to_string(),
+        command: command.to_string(),
+        args: strings(args),
+        extensions: strings(extensions),
+        env: HashMap::new(),
+        initialization: None,
+        root_markers: strings(root_markers),
+        runtime_kind: LspRuntimeKind::ToolchainProvided,
+        project_local_candidates: Vec::new(),
+        requirements: Some(requirements.to_string()),
+        managed_npm: None,
+    }
+}
+
+fn project_server(
+    id: &str,
+    command: &str,
+    args: Vec<&str>,
+    extensions: Vec<&str>,
+    root_markers: Vec<&str>,
+    project_local_candidates: Vec<&str>,
+    requirements: &str,
+) -> LspServerConfig {
+    LspServerConfig {
+        id: id.to_string(),
+        command: command.to_string(),
+        args: strings(args),
+        extensions: strings(extensions),
+        env: HashMap::new(),
+        initialization: None,
+        root_markers: strings(root_markers),
+        runtime_kind: LspRuntimeKind::ProjectDependency,
+        project_local_candidates: strings(project_local_candidates),
+        requirements: Some(requirements.to_string()),
+        managed_npm: None,
+    }
+}
+
+fn managed_npm_server(
+    id: &str,
+    command: &str,
+    args: Vec<&str>,
+    extensions: Vec<&str>,
+    root_markers: Vec<&str>,
+    package: &str,
+    version: &str,
+    bin: &str,
+    project_local_candidates: Vec<&str>,
+    requirements: &str,
+) -> LspServerConfig {
+    LspServerConfig {
+        id: id.to_string(),
+        command: command.to_string(),
+        args: strings(args),
+        extensions: strings(extensions),
+        env: HashMap::new(),
+        initialization: None,
+        root_markers: strings(root_markers),
+        runtime_kind: LspRuntimeKind::ManagedNpm,
+        project_local_candidates: strings(project_local_candidates),
+        requirements: Some(requirements.to_string()),
+        managed_npm: Some(ManagedNpmLspServerConfig {
+            package: package.to_string(),
+            version: version.to_string(),
+            bin: bin.to_string(),
+        }),
+    }
+}
+
+fn package_roots() -> Vec<&'static str> {
+    vec![
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ]
+}
+
+fn strings(values: Vec<&str>) -> Vec<String> {
+    values.into_iter().map(str::to_string).collect()
+}
+
+trait LspServerConfigExt {
+    fn with_initialization(self, initialization: serde_json::Value) -> Self;
+}
+
+impl LspServerConfigExt for LspServerConfig {
+    fn with_initialization(mut self, initialization: serde_json::Value) -> Self {
+        self.initialization = Some(initialization);
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ConfigToml;
-    use crate::config::types::LspServerToml;
     use crate::config::types::LspToml;
+    use crate::config::types::ManagedNpmLspServerToml;
     use crate::features::Features;
 
     #[test]
@@ -687,6 +578,8 @@ mod tests {
         let cfg = ConfigToml {
             lsp: Some(LspToml {
                 enabled: Some(true),
+                mode: Some(LspMode::On),
+                assume_yes: Some(true),
                 servers: HashMap::from([
                     (
                         "rust".to_string(),
@@ -703,6 +596,12 @@ mod tests {
                         LspServerToml {
                             command: Some("custom-lsp".to_string()),
                             extensions: Some(vec![".custom".to_string()]),
+                            managed_npm: Some(ManagedNpmLspServerToml {
+                                package: "custom-pkg".to_string(),
+                                version: "1.0.0".to_string(),
+                                bin: "custom-lsp".to_string(),
+                            }),
+                            runtime_kind: Some(LspRuntimeKind::ManagedNpm),
                             ..Default::default()
                         },
                     ),
@@ -717,46 +616,28 @@ mod tests {
         let config = resolve_lsp_config(&cfg, &features)
             .expect("resolve LSP config")
             .expect("enabled");
+        assert_eq!(config.mode, LspMode::On);
+        assert!(config.assume_yes);
         assert!(config.servers.iter().any(|server| server.id == "custom"));
-        assert!(
-            config
-                .servers
-                .iter()
-                .find(|server| server.id == "rust")
-                .expect("rust server")
-                .env
-                .contains_key("RUST_LOG")
-        );
-
-        let intelephense = config
+        let rust = config
             .servers
             .iter()
-            .find(|server| server.id == "intelephense")
-            .expect("intelephense built-in");
-        assert_eq!(intelephense.command, "intelephense");
-        assert_eq!(intelephense.args, vec!["--stdio"]);
-        assert_eq!(intelephense.extensions, vec![".php"]);
+            .find(|server| server.id == "rust")
+            .expect("rust server");
+        assert_eq!(rust.env.get("RUST_LOG"), Some(&"debug".to_string()));
+        let custom = config
+            .servers
+            .iter()
+            .find(|server| server.id == "custom")
+            .expect("custom server");
+        assert_eq!(custom.runtime_kind, LspRuntimeKind::ManagedNpm);
         assert_eq!(
-            intelephense.initialization,
-            Some(json!({
-                "telemetry": {
-                    "enabled": false,
-                },
-            }))
+            custom.managed_npm,
+            Some(ManagedNpmLspServerConfig {
+                package: "custom-pkg".to_string(),
+                version: "1.0.0".to_string(),
+                bin: "custom-lsp".to_string(),
+            })
         );
-        assert!(
-            intelephense
-                .root_markers
-                .iter()
-                .any(|marker| marker == ".php-version")
-        );
-
-        let sourcekit = config
-            .servers
-            .iter()
-            .find(|server| server.id == "sourcekit")
-            .expect("sourcekit server");
-        assert!(sourcekit.extensions.iter().any(|ext| ext == ".objc"));
-        assert!(sourcekit.extensions.iter().any(|ext| ext == ".objcpp"));
     }
 }

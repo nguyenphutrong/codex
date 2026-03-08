@@ -14,7 +14,7 @@ Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the c
 
 ## LSP integration
 
-Codex includes an experimental built-in LSP integration for definitions, references, hover text, symbols, call hierarchy, diagnostics, and save notifications for touched files.
+Codex includes an experimental built-in LSP integration for definitions, references, hover text, symbols, call hierarchy, diagnostics, save notifications, and managed installation of some built-in servers.
 
 For setup, built-in server catalog, overrides, custom servers, disable options, troubleshooting, and a full example, see [`docs/lsp.md`](./lsp.md).
 

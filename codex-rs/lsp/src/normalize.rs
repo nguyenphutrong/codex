@@ -8,6 +8,7 @@ use std::path::Path;
 
 pub(crate) fn diagnostic_from_value(path: &Path, value: &Value) -> Option<LspDiagnostic> {
     Some(LspDiagnostic {
+        server: None,
         path: path.to_path_buf(),
         range: range_from_value(value.get("range")?)?,
         severity: value

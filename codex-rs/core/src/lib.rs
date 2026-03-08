@@ -43,6 +43,7 @@ mod flags;
 pub mod git_info;
 pub mod instructions;
 pub mod landlock;
+pub mod lsp_runtime;
 pub mod mcp;
 mod mcp_connection_manager;
 pub mod models_manager;

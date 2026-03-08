@@ -38,10 +38,12 @@ use supports_color::Stream;
 mod app_cmd;
 #[cfg(target_os = "macos")]
 mod desktop_app;
+mod lsp_cmd;
 mod mcp_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
+use crate::lsp_cmd::LspCli;
 use crate::mcp_cmd::McpCli;
 
 use codex_core::config::Config;
@@ -74,6 +76,14 @@ struct MultitoolCli {
     #[clap(flatten)]
     pub feature_toggles: FeatureToggles,
 
+    /// LSP runtime mode for this invocation.
+    #[arg(long = "lsp", value_enum, global = true)]
+    lsp_mode: Option<LspModeArg>,
+
+    /// Accept automatic LSP installation flows without prompting.
+    #[arg(long = "yes", default_value_t = false, global = true)]
+    yes: bool,
+
     #[clap(flatten)]
     interactive: TuiCli,
 
@@ -98,6 +108,9 @@ enum Subcommand {
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
+
+    /// Inspect built-in LSP detection, status, and diagnostics.
+    Lsp(LspCli),
 
     /// Start Codex as an MCP server (stdio).
     McpServer,
@@ -245,6 +258,14 @@ enum SandboxCommand {
 
     /// Run a command under Windows restricted token (Windows only).
     Windows(WindowsCommand),
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum LspModeArg {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Parser)]
@@ -561,6 +582,8 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
+        lsp_mode,
+        yes,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
@@ -568,6 +591,22 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
+    if let Some(mode) = lsp_mode {
+        root_config_overrides
+            .raw_overrides
+            .push("features.lsp=true".to_string());
+        root_config_overrides
+            .raw_overrides
+            .push("lsp.enabled=true".to_string());
+        root_config_overrides
+            .raw_overrides
+            .push(format!("lsp.mode=\"{}\"", lsp_mode_str(mode)));
+    }
+    if yes {
+        root_config_overrides
+            .raw_overrides
+            .push("lsp.assume_yes=true".to_string());
+    }
 
     match subcommand {
         None => {
@@ -601,6 +640,10 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             // Propagate any root-level config overrides (e.g. `-c key=value`).
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
+        }
+        Some(Subcommand::Lsp(mut lsp_cli)) => {
+            prepend_config_flags(&mut lsp_cli.config_overrides, root_config_overrides.clone());
+            lsp_cli.run(&interactive).await?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => match app_server_cli.subcommand {
             None => {
@@ -834,6 +877,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn lsp_mode_str(mode: LspModeArg) -> &'static str {
+    match mode {
+        LspModeArg::Auto => "auto",
+        LspModeArg::On => "on",
+        LspModeArg::Off => "off",
+    }
 }
 
 async fn enable_feature_in_config(interactive: &TuiCli, feature: &str) -> anyhow::Result<()> {
@@ -1112,6 +1163,8 @@ mod tests {
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
+            lsp_mode: _,
+            yes: _,
         } = cli;
 
         let Subcommand::Resume(ResumeCommand {
@@ -1141,6 +1194,8 @@ mod tests {
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
+            lsp_mode: _,
+            yes: _,
         } = cli;
 
         let Subcommand::Fork(ForkCommand {
@@ -1468,6 +1523,19 @@ mod tests {
             app_server.listen,
             codex_app_server::AppServerTransport::Stdio
         );
+    }
+
+    #[test]
+    fn lsp_flag_parses_at_root() {
+        let cli = MultitoolCli::try_parse_from(["codex", "--lsp", "auto", "lsp", "status"])
+            .expect("parse");
+        assert!(matches!(cli.lsp_mode, Some(LspModeArg::Auto)));
+    }
+
+    #[test]
+    fn lsp_yes_flag_parses_at_root() {
+        let cli = MultitoolCli::try_parse_from(["codex", "--yes", "lsp", "status"]).expect("parse");
+        assert!(cli.yes);
     }
 
     #[test]

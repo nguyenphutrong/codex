@@ -28,17 +28,40 @@ pub enum LspClientState {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspServerAvailability {
+    Ready,
+    Installing,
+    Unavailable,
+    RequirementsMissing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LspServerSource {
+    Configured,
+    Project,
+    Global,
+    ManagedCache,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LspStatus {
     pub server: String,
     pub workspace_root: PathBuf,
     pub state: LspClientState,
+    pub availability: LspServerAvailability,
+    pub source: Option<LspServerSource>,
     pub retry_after_seconds: Option<u64>,
     pub last_error: Option<String>,
+    pub requirements: Option<String>,
+    pub resolved_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LspDiagnostic {
+    pub server: Option<String>,
     pub path: PathBuf,
     pub range: LspRange,
     pub severity: Option<u8>,
@@ -71,4 +94,26 @@ pub struct PositionRequest {
     pub file_path: PathBuf,
     pub line: usize,
     pub character: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub source: LspServerSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableServer {
+    pub availability: LspServerAvailability,
+    pub reason: String,
+    pub requirements: Option<String>,
+    pub source: Option<LspServerSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerResolution {
+    Resolved(ResolvedServerConfig),
+    Unavailable(UnavailableServer),
 }
