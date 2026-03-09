@@ -152,12 +152,11 @@ async fn run_diagnostics(
         println!("{}", path.display());
         for diagnostic in values {
             let server = diagnostic.server.unwrap_or_else(|| "unknown".to_string());
+            let line = diagnostic.range.start.line.saturating_add(1);
+            let character = diagnostic.range.start.character.saturating_add(1);
             println!(
                 "  [{}] {}:{} {}",
-                server,
-                diagnostic.range.start.line,
-                diagnostic.range.start.character,
-                diagnostic.message
+                server, line, character, diagnostic.message
             );
         }
     }

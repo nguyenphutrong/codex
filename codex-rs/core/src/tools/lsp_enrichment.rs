@@ -202,22 +202,70 @@ fn format_lsp_diagnostics(
             let body = errors
                 .iter()
                 .map(|diagnostic| {
+                    let line = diagnostic.range.start.line.saturating_add(1);
+                    let character = diagnostic.range.start.character.saturating_add(1);
                     format!(
                         "ERROR [{}:{}] {}",
-                        diagnostic.range.start.line,
-                        diagnostic.range.start.character,
+                        line,
+                        character,
                         diagnostic.message
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "LSP errors detected in {label}, please fix:\n<diagnostics file=\"{}\">\n{body}\n</diagnostics>",
+                    "LSP errors detected in {label}, please fix:\n<diagnostics file=\"{}\">\n{body}\n</diagnostics>",
                 path.display()
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_lsp::LspPosition;
+    use codex_lsp::LspRange;
+    use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
+
+    #[test]
+    fn formats_diagnostics_with_one_based_positions() {
+        let path = PathBuf::from("/repo/main.rs");
+        let mut diagnostics = HashMap::new();
+        diagnostics.insert(
+            path.clone(),
+            vec![LspDiagnostic {
+                server: Some("rust-analyzer".to_string()),
+                path: path.clone(),
+                range: LspRange {
+                    start: LspPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: LspPosition {
+                        line: 0,
+                        character: 1,
+                    },
+                },
+                severity: Some(1),
+                message: "oops".to_string(),
+                source: None,
+            }],
+        );
+
+        let formatted = format_lsp_diagnostics(Path::new("/repo"), diagnostics);
+
+        assert!(
+            formatted.contains("ERROR [1:1] oops"),
+            "expected one-based line/character, got `{formatted}`"
+        );
+        assert_eq!(
+            formatted.lines().next().unwrap(),
+            "LSP errors detected in main.rs, please fix:"
+        );
+    }
 }
 
 #[cfg(test)]
