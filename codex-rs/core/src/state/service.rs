@@ -20,6 +20,7 @@ use crate::tools::runtimes::ExecveSessionApproval;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_hooks::Hooks;
+use codex_lsp::SessionManager as LspSessionManager;
 use codex_otel::SessionTelemetry;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::PathBuf;
@@ -57,6 +58,7 @@ pub(crate) struct SessionServices {
     pub(crate) network_proxy: Option<StartedNetworkProxy>,
     pub(crate) network_approval: Arc<NetworkApprovalService>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) lsp_manager: Option<Arc<LspSessionManager>>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
 }

@@ -83,6 +83,8 @@ pub enum Feature {
     // Experimental
     /// Enable JavaScript REPL tools backed by a persistent Node kernel.
     JsRepl,
+    /// Enable built-in Language Server Protocol tooling.
+    Lsp,
     /// Only expose js_repl tools directly to the model.
     JsReplToolsOnly,
     /// Use the single unified PTY-backed exec tool.
@@ -505,6 +507,16 @@ pub const FEATURES: &[FeatureSpec] = &[
             name: "JavaScript REPL",
             menu_description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities. Requires Node >= v22.22.0 installed.",
             announcement: "NEW: JavaScript REPL is now available in /experimental. Enable it, then start a new chat or restart Codex to use it.",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Lsp,
+        key: "lsp",
+        stage: Stage::Experimental {
+            name: "LSP integration",
+            menu_description: "Enable built-in Language Server Protocol tooling for definitions, references, hover information, and post-edit diagnostics.",
+            announcement: "NEW: Experimental LSP integration adds code intelligence and diagnostics to Codex. Enable it in /experimental and restart Codex to try it.",
         },
         default_enabled: false,
     },

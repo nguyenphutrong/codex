@@ -19,6 +19,7 @@ use crate::sandboxing::ExecRequest;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
+use crate::tools::lsp_enrichment::GitStatusSnapshot;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use crate::tools::network_approval::finish_deferred_network_approval;
 use crate::tools::orchestrator::ToolOrchestrator;
@@ -290,6 +291,7 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             session_command: Some(request.command.clone()),
+            git_status_snapshot: None,
         };
 
         Ok(response)
@@ -358,15 +360,15 @@ impl UnifiedExecProcessManager {
         // that through so the handler can tag TerminalInteraction with an
         // appropriate process_id and exit_code.
         let status = self.refresh_process_state(process_id.as_str()).await;
-        let (process_id, exit_code, event_call_id) = match status {
+        let (process_id, exit_code, event_call_id, git_status_snapshot) = match status {
             ProcessStatus::Alive {
                 exit_code,
                 call_id,
                 process_id,
-            } => (Some(process_id), exit_code, call_id),
+            } => (Some(process_id), exit_code, call_id, None),
             ProcessStatus::Exited { exit_code, entry } => {
                 let call_id = entry.call_id.clone();
-                (None, exit_code, call_id)
+                (None, exit_code, call_id, entry.git_status_snapshot.clone())
             }
             ProcessStatus::Unknown => {
                 return Err(UnifiedExecError::UnknownProcessId {
@@ -385,6 +387,7 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             session_command: Some(session_command.clone()),
+            git_status_snapshot,
         };
 
         Ok(response)
@@ -485,6 +488,7 @@ impl UnifiedExecProcessManager {
             process_id: process_id.clone(),
             command: command.to_vec(),
             tty,
+            git_status_snapshot: None,
             network_approval_id,
             session: Arc::downgrade(&context.session),
             last_used: started_at,
@@ -760,6 +764,17 @@ impl UnifiedExecProcessManager {
         for entry in entries {
             Self::unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
+        }
+    }
+
+    pub(crate) async fn set_git_status_snapshot(
+        &self,
+        process_id: &str,
+        snapshot: GitStatusSnapshot,
+    ) {
+        let mut store = self.process_store.lock().await;
+        if let Some(entry) = store.processes.get_mut(process_id) {
+            entry.git_status_snapshot = Some(snapshot);
         }
     }
 }

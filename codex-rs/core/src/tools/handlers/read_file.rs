@@ -99,7 +99,12 @@ impl ToolHandler for ReadFileHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation {
+            session,
+            turn,
+            payload,
+            ..
+        } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -146,6 +151,16 @@ impl ToolHandler for ReadFileHandler {
                 indentation::read_block(&path, offset, limit, indentation).await?
             }
         };
+
+        if let Some(lsp_manager) = session.services.lsp_manager.as_ref() {
+            let lsp_manager = lsp_manager.clone();
+            let file_path = path.clone();
+            let cwd = turn.cwd.clone();
+            tokio::spawn(async move {
+                let _ = lsp_manager.touch_file(&file_path, &cwd, false).await;
+            });
+        }
+
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(collected.join("\n")),
             success: Some(true),
@@ -488,7 +503,13 @@ mod tests {
     use super::indentation::read_block;
     use super::slice::read;
     use super::*;
+    use crate::codex::make_session_and_context_with_rx;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     #[tokio::test]
@@ -986,6 +1007,45 @@ private:
                 "L23:     }".to_string(),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_file_warmup_does_not_fail_when_lsp_unavailable() -> anyhow::Result<()> {
+        let (session, turn, _rx) = make_session_and_context_with_rx().await;
+        let handler = ReadFileHandler;
+
+        let mut temp = NamedTempFile::new()?;
+        use std::io::Write as _;
+        writeln!(temp, "line-one")?;
+
+        let arguments = serde_json::json!({
+            "file_path": temp.path().to_string_lossy(),
+            "offset": 1,
+            "limit": 1,
+        })
+        .to_string();
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let output = handler
+            .handle(ToolInvocation {
+                session,
+                turn,
+                tracker,
+                call_id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
+                payload: ToolPayload::Function { arguments },
+            })
+            .await
+            .expect("handler success");
+
+        assert!(matches!(
+            output,
+            ToolOutput::Function {
+                success: Some(true),
+                ..
+            }
+        ));
         Ok(())
     }
 }

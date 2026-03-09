@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as SerdeError;
+use serde_json::Value as JsonValue;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 16;
@@ -555,6 +556,88 @@ pub struct AppsConfigToml {
     /// Per-app settings keyed by app ID (for example `[apps.google_drive]`).
     #[serde(default, flatten)]
     pub apps: HashMap<String, AppConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LspToml {
+    pub enabled: Option<bool>,
+    pub mode: Option<LspMode>,
+    pub assume_yes: Option<bool>,
+    #[serde(default)]
+    pub servers: HashMap<String, LspServerToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LspMode {
+    Off,
+    #[default]
+    Auto,
+    On,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LspRuntimeKind {
+    ToolchainProvided,
+    ProjectDependency,
+    ManagedNpm,
+    ManagedGithubRelease,
+    UserConfigured,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ManagedNpmLspServerToml {
+    pub package: String,
+    pub version: String,
+    pub bin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedNpmLspServerConfig {
+    pub package: String,
+    pub version: String,
+    pub bin: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct LspServerToml {
+    pub disabled: Option<bool>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub extensions: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub initialization: Option<JsonValue>,
+    pub root_markers: Option<Vec<String>>,
+    pub runtime_kind: Option<LspRuntimeKind>,
+    pub project_local_candidates: Option<Vec<String>>,
+    pub requirements: Option<String>,
+    pub managed_npm: Option<ManagedNpmLspServerToml>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspConfig {
+    pub mode: LspMode,
+    pub assume_yes: bool,
+    pub servers: Vec<LspServerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub extensions: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization: Option<JsonValue>,
+    pub root_markers: Vec<String>,
+    pub runtime_kind: LspRuntimeKind,
+    pub project_local_candidates: Vec<String>,
+    pub requirements: Option<String>,
+    pub managed_npm: Option<ManagedNpmLspServerConfig>,
 }
 
 // ===== OTEL configuration =====

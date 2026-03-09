@@ -195,6 +195,7 @@ use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherEvent;
 use crate::git_info::get_git_repo_root;
 use crate::instructions::UserInstructions;
+use crate::lsp_runtime::build_lsp_session_manager;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::McpManager;
 use crate::mcp::auth::compute_auth_statuses;
@@ -760,6 +761,7 @@ impl TurnContext {
         })
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
+        .with_lsp_enabled(config.lsp.is_some())
         .with_agent_roles(config.agent_roles.clone());
 
         Self {
@@ -1144,6 +1146,7 @@ impl Session {
         })
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
+        .with_lsp_enabled(per_turn_config.lsp.is_some())
         .with_agent_roles(per_turn_config.agent_roles.clone());
 
         let cwd = session_configuration.cwd.clone();
@@ -1528,6 +1531,7 @@ impl Session {
             } else {
                 (None, None)
             };
+        let lsp_manager = build_lsp_session_manager(&config);
 
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
@@ -1571,6 +1575,7 @@ impl Session {
             network_proxy,
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
+            lsp_manager,
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
@@ -4943,6 +4948,7 @@ async fn spawn_review_thread(
     })
     .with_web_search_config(None)
     .with_allow_login_shell(config.permissions.allow_login_shell)
+    .with_lsp_enabled(config.lsp.is_some())
     .with_agent_roles(config.agent_roles.clone());
 
     let review_prompt = resolved.prompt.clone();

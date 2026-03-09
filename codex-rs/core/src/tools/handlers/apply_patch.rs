@@ -19,6 +19,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::lsp_enrichment::enrich_output_with_lsp_diagnostics;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -108,9 +109,20 @@ impl ToolHandler for ApplyPatchHandler {
         let command = vec!["apply_patch".to_string(), patch_input.clone()];
         match codex_apply_patch::maybe_parse_apply_patch_verified(&command, &cwd) {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+                let touched_files = file_paths_for_action(&changes);
                 match apply_patch::apply_patch(turn.as_ref(), changes).await {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
+                        let content = enrich_output_with_lsp_diagnostics(
+                            session.as_ref(),
+                            turn.as_ref(),
+                            content,
+                            &touched_files
+                                .iter()
+                                .map(AbsolutePathBuf::to_path_buf)
+                                .collect::<Vec<_>>(),
+                        )
+                        .await;
                         Ok(ToolOutput::Function {
                             body: FunctionCallOutputBody::Text(content),
                             success: Some(true),
@@ -131,7 +143,7 @@ impl ToolHandler for ApplyPatchHandler {
 
                         let req = ApplyPatchRequest {
                             action: apply.action,
-                            file_paths,
+                            file_paths: file_paths.clone(),
                             changes,
                             exec_approval_requirement: apply.exec_approval_requirement,
                             timeout_ms: None,
@@ -163,6 +175,16 @@ impl ToolHandler for ApplyPatchHandler {
                             Some(&tracker),
                         );
                         let content = emitter.finish(event_ctx, out).await?;
+                        let content = enrich_output_with_lsp_diagnostics(
+                            session.as_ref(),
+                            turn.as_ref(),
+                            content,
+                            &file_paths
+                                .iter()
+                                .map(AbsolutePathBuf::to_path_buf)
+                                .collect::<Vec<_>>(),
+                        )
+                        .await;
                         Ok(ToolOutput::Function {
                             body: FunctionCallOutputBody::Text(content),
                             success: Some(true),
@@ -203,6 +225,7 @@ pub(crate) async fn intercept_apply_patch(
 ) -> Result<Option<ToolOutput>, FunctionCallError> {
     match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd) {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+            let touched_files = file_paths_for_action(&changes);
             session
                 .record_model_warning(
                     format!(
@@ -214,6 +237,16 @@ pub(crate) async fn intercept_apply_patch(
             match apply_patch::apply_patch(turn.as_ref(), changes).await {
                 InternalApplyPatchInvocation::Output(item) => {
                     let content = item?;
+                    let content = enrich_output_with_lsp_diagnostics(
+                        session.as_ref(),
+                        turn.as_ref(),
+                        content,
+                        &touched_files
+                            .iter()
+                            .map(AbsolutePathBuf::to_path_buf)
+                            .collect::<Vec<_>>(),
+                    )
+                    .await;
                     Ok(Some(ToolOutput::Function {
                         body: FunctionCallOutputBody::Text(content),
                         success: Some(true),
@@ -233,7 +266,7 @@ pub(crate) async fn intercept_apply_patch(
 
                     let req = ApplyPatchRequest {
                         action: apply.action,
-                        file_paths: approval_keys,
+                        file_paths: approval_keys.clone(),
                         changes,
                         exec_approval_requirement: apply.exec_approval_requirement,
                         timeout_ms,
@@ -265,6 +298,16 @@ pub(crate) async fn intercept_apply_patch(
                         tracker.as_ref().copied(),
                     );
                     let content = emitter.finish(event_ctx, out).await?;
+                    let content = enrich_output_with_lsp_diagnostics(
+                        session.as_ref(),
+                        turn.as_ref(),
+                        content,
+                        &approval_keys
+                            .iter()
+                            .map(AbsolutePathBuf::to_path_buf)
+                            .collect::<Vec<_>>(),
+                    )
+                    .await;
                     Ok(Some(ToolOutput::Function {
                         body: FunctionCallOutputBody::Text(content),
                         success: Some(true),

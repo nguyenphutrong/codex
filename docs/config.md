@@ -12,6 +12,12 @@ Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the c
 
 - https://developers.openai.com/codex/config-reference
 
+## LSP integration
+
+Codex includes an experimental built-in LSP integration for definitions, references, hover text, symbols, call hierarchy, diagnostics, save notifications, and managed installation of some built-in servers.
+
+For setup, built-in server catalog, overrides, custom servers, disable options, troubleshooting, and a full example, see [`docs/lsp.md`](./lsp.md).
+
 ## Apps (Connectors)
 
 Use `$` in the composer to insert a ChatGPT connector; the popover lists accessible

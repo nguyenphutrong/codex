@@ -380,6 +380,9 @@
             "js_repl_tools_only": {
               "type": "boolean"
             },
+            "lsp": {
+              "type": "boolean"
+            },
             "memories": {
               "type": "boolean"
             },
@@ -663,6 +666,118 @@
           "type": "string"
         }
       ]
+    },
+    "LspMode": {
+      "enum": [
+        "off",
+        "auto",
+        "on"
+      ],
+      "type": "string"
+    },
+    "LspRuntimeKind": {
+      "enum": [
+        "toolchain_provided",
+        "project_dependency",
+        "managed_npm",
+        "managed_github_release",
+        "user_configured"
+      ],
+      "type": "string"
+    },
+    "LspServerToml": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "extensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "initialization": true,
+        "managed_npm": {
+          "$ref": "#/definitions/ManagedNpmLspServerToml"
+        },
+        "project_local_candidates": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requirements": {
+          "type": "string"
+        },
+        "root_markers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "runtime_kind": {
+          "$ref": "#/definitions/LspRuntimeKind"
+        }
+      },
+      "type": "object"
+    },
+    "LspToml": {
+      "additionalProperties": false,
+      "properties": {
+        "assume_yes": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/definitions/LspMode"
+        },
+        "servers": {
+          "additionalProperties": {
+            "$ref": "#/definitions/LspServerToml"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ManagedNpmLspServerToml": {
+      "additionalProperties": false,
+      "properties": {
+        "bin": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bin",
+        "package",
+        "version"
+      ],
+      "type": "object"
     },
     "MemoriesToml": {
       "additionalProperties": false,
@@ -1852,6 +1967,9 @@
         "js_repl_tools_only": {
           "type": "boolean"
         },
+        "lsp": {
+          "type": "boolean"
+        },
         "memories": {
           "type": "boolean"
         },
@@ -2023,6 +2141,14 @@
         }
       ],
       "description": "Directory where Codex writes log files, for example `codex-tui.log`. Defaults to `$CODEX_HOME/log`."
+    },
+    "lsp": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LspToml"
+        }
+      ],
+      "description": "LSP runtime settings used for built-in code intelligence features."
     },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
